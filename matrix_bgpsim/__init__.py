@@ -41,6 +41,15 @@ class RMatrix:
 
     @staticmethod
     def caida_reader(fpath):
+        """
+        Parse a CAIDA-formatted AS relationship file.
+
+        Args:
+            fpath (str | Path): Path to the CAIDA relationship file.
+
+        Yields:
+            tuple[str, str, int]: (asn1, asn2, rel) for each AS pair.
+        """
         with open(fpath, "r") as f:
             for line in f:
                 line = line.strip()
@@ -51,6 +60,13 @@ class RMatrix:
                 yield asn1, asn2, rel
 
     def __init__(self, input_rels, excluded=None):
+        """
+        Initialize the RMatrix object.
+
+        Args:
+            input_rels (str | Path | Iterable): Either a path to a CAIDA file or an iterable of (asn1, asn2, rel) tuples.
+            excluded (None | container | Callable, optional): ASNs to exclude or a function for membership check.
+        """
         (
             # core AS information
             self.__idx2asn__,
@@ -68,6 +84,26 @@ class RMatrix:
 
     @staticmethod
     def construct_topology(input_rels, excluded=None):
+        """
+        Build the AS-level topology.
+
+        Steps:
+            - Parse AS relationship data
+            - Identify and remove excluded ASNs
+            - Detect branches and dangling sub-trees
+            - Build core network adjacency lists
+
+        Args:
+            input_rels (str | Path | Iterable): Path to CAIDA file or iterable of AS relationships.
+            excluded (None | container | Callable): ASNs to exclude.
+
+        Returns:
+            tuple: (idx2asn, asn2idx, idx2ngbrs, asn2brts)
+                idx2asn (list): Index-to-ASN mapping for core ASes
+                asn2idx (dict): ASN-to-index mapping for core ASes
+                idx2ngbrs (list[RelMap]): Core AS neighbors by relationship type
+                asn2brts (dict): Branch ASN → BranchRoute
+        """
         # TODO (future): parallel simulation for disconnected sub-topologies
         # If the topology has several disconnected areas, assign each with a
         # single simluation task, so the matrix size can be greatly reduced.
@@ -183,28 +219,44 @@ class RMatrix:
         return idx2asn, asn2idx, idx2ngbrs, asn2brts
 
     def asn2idx(self, asn):
+        """Return the index of a core ASN."""
         return self.__asn2idx__[asn]
 
     def idx2asn(self, idx):
+        """Return the ASN corresponding to a given core AS index."""
         return self.__idx2asn__[idx]
 
     def idx2ngbrs(self, idx):
+        """Return neighbors of a core AS (as RelMap)."""
         return self.__idx2ngbrs__[idx]
 
     def asn2brts(self, asn):
+        """Return branch route details for a branch ASN."""
         return self.__asn2brts__[asn]
 
     def is_core_asn(self, asn):
+        """Check if an ASN belongs to the core network."""
         return asn in self.__asn2idx__
 
     def is_branch_asn(self, asn):
+        """Check if an ASN belongs to a branch."""
         return asn in self.__asn2brts__
 
     def has_asn(self, asn):
+        """Check if an ASN exists in the topology (core or branch)."""
         return self.is_core_asn(asn) or self.is_branch_asn(asn)
 
     @staticmethod
     def __iterate_state_cpu__(worker_id, left, right, max_iter):
+        """
+        Worker process: Propagate routing states without next-hop info.
+
+        Args:
+            worker_id (int): Worker identifier for logging.
+            left (int): Start column index for this worker.
+            right (int): End column index for this worker.
+            max_iter (int): Maximum number of iterations to run.
+        """
         shared = RMatrix.__shared_matrix__
 
         state = np.frombuffer(
@@ -248,6 +300,15 @@ class RMatrix:
 
     @staticmethod
     def __iterate_state_and_next_hop_cpu__(worker_id, left, right, max_iter):
+        """
+        Worker process: Propagate routing states and compute next-hop info.
+
+        Args:
+            worker_id (int): Worker identifier for logging.
+            left (int): Start column index for this worker.
+            right (int): End column index for this worker.
+            max_iter (int): Maximum number of iterations to run.
+        """
         shared = RMatrix.__shared_matrix__
 
         state = np.frombuffer(
@@ -297,15 +358,62 @@ class RMatrix:
         # where no route is available, the next-hop is manually set to -1
         next_hop[:, left:right][state[:, left:right] <= 0b00_111111] = -1
 
-    def run(self, n_jobs=1, max_iter=32, save_next_hop=True):
-        RMatrix.__cpu_runner__(self.__idx2ngbrs__, n_jobs, max_iter, save_next_hop)()
-        self.__state__ = RMatrix.__shared_matrix__.pop("state", None)
-        self.__next_hop__ = RMatrix.__shared_matrix__.pop("next_hop", None)
-        RMatrix.__shared_matrix__ = {}
+    def run(self, n_jobs=1, max_iter=32, save_next_hop=True, backend="cpu", device=None):
+        """
+        Run the routing simulation.
+
+        Args:
+            n_jobs (int): Number of parallel processes (CPU only).
+            max_iter (int): Maximum number of iterations.
+            save_next_hop (bool): Whether to compute next-hop matrix.
+            backend (str): One of {"cpu", "torch", "cupy"}.
+                - "cpu": Default, uses NumPy + multiprocessing.
+                - "torch": GPU/CPU acceleration via PyTorch (requires `pip install matrix-bgpsim[torch]`).
+                - "cupy": GPU acceleration via CuPy (requires `pip install matrix-bgpsim[cupy]`).
+            device (str | None): Device specifier for GPU backends (e.g., "cuda:0", "cpu").
+                Ignored for CPU backend. Defaults:
+                - torch: Uses "cuda:0" if available, else "cpu".
+                - cupy: Uses first available CUDA device.
+        """
+        if backend == "cpu":
+            runner = RMatrix.__cpu_runner__(self.__idx2ngbrs__, n_jobs, max_iter, save_next_hop)
+        elif backend == "torch":
+            try:
+                import torch
+            except ImportError:
+                raise ImportError("Torch backend requires PyTorch. Install with `pip install matrix-bgpsim[torch]`.")
+            if device is None:
+                device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            runner = RMatrix.__torch_runner__(self.__idx2ngbrs__, max_iter, save_next_hop, device)
+        elif backend == "cupy":
+            try:
+                import cupy as cp
+            except ImportError:
+                raise ImportError("CuPy backend requires CuPy. Install with `pip install matrix-bgpsim[cupy]`.")
+            if device is None:
+                device = 0 # CuPy uses integer device IDs
+            cp.cuda.Device(device).use()
+            runner = RMatrix.__cupy_runner__(self.__idx2ngbrs__, max_iter, save_next_hop, device)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+        self.__state__, self.__next_hop__ = runner()
         return self
 
     @staticmethod
     def __cpu_runner__(idx2ngbrs, n_jobs, max_iter, save_next_hop):
+        """
+        Prepare shared memory and return a multiprocessing runner function.
+
+        Args:
+            idx2ngbrs (list[RelMap]): Core AS neighbors.
+            n_jobs (int): Number of parallel processes.
+            max_iter (int): Maximum iterations for state propagation.
+            save_next_hop (bool): Whether to compute next-hop info.
+
+        Returns:
+            Callable: A runner function that launches the simulation.
+        """
         # init matrix
         size = len(idx2ngbrs)
         shape = (size, size)
@@ -348,46 +456,169 @@ class RMatrix:
         print(f"runner with {n_jobs} processes.")
 
         if save_next_hop:
-            def runner():
-                def initializer(state, link1, link2, next_hop, shape):
-                    RMatrix.__shared_matrix__["state"] = state
-                    RMatrix.__shared_matrix__["link1"] = link1
-                    RMatrix.__shared_matrix__["link2"] = link2
-                    RMatrix.__shared_matrix__["next_hop"] = next_hop
-                    RMatrix.__shared_matrix__["shape"] = shape
-
-                initargs = (state, link1, link2, next_hop, shape)
-
-                params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
-
-                with Pool(processes=n_jobs, initializer=initializer,
-                        initargs=initargs) as pool:
-                    pool.starmap(RMatrix.__iterate_state_and_next_hop_cpu__, params)
+            def initializer(state, link1, link2, next_hop, shape):
+                RMatrix.__shared_matrix__["state"] = state
+                RMatrix.__shared_matrix__["link1"] = link1
+                RMatrix.__shared_matrix__["link2"] = link2
+                RMatrix.__shared_matrix__["next_hop"] = next_hop
+                RMatrix.__shared_matrix__["shape"] = shape
+            initargs = (state, link1, link2, next_hop, shape)
+            process_call = RMatrix.__iterate_state_and_next_hop_cpu__
         else:
-            def runner():
-                def initializer(state, link1, link2, shape):
-                    RMatrix.__shared_matrix__["state"] = state
-                    RMatrix.__shared_matrix__["link1"] = link1
-                    RMatrix.__shared_matrix__["link2"] = link2
-                    RMatrix.__shared_matrix__["shape"] = shape
+            def initializer(state, link1, link2, shape):
+                RMatrix.__shared_matrix__["state"] = state
+                RMatrix.__shared_matrix__["link1"] = link1
+                RMatrix.__shared_matrix__["link2"] = link2
+                RMatrix.__shared_matrix__["shape"] = shape
+            initargs = (state, link1, link2, shape)
+            process_call = RMatrix.__iterate_state_cpu__
 
-                initargs = (state, link1, link2, shape)
+        params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
 
-                params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
-
-                with Pool(processes=n_jobs, initializer=initializer,
-                        initargs=initargs) as pool:
-                    pool.starmap(RMatrix.__iterate_state_cpu__, params)
+        def runner():
+            try:
+                with Pool(processes=n_jobs, initializer=initializer, initargs=initargs) as pool:
+                    pool.starmap(process_call, params)
+                return (RMatrix.__shared_matrix__.pop("state", None),
+                        RMatrix.__shared_matrix__.pop("next_hop", None))
+            finally:
+                RMatrix.__shared_matrix__ = {}
 
         return runner
 
+    @staticmethod
+    def __torch_runner__(idx2ngbrs, max_iter, save_next_hop, device="cuda:0"):
+        """
+        Prepare a runner for simulation on PyTorch backend.
+
+        Args:
+            idx2ngbrs (list[RelMap]): Core AS neighbors.
+            max_iter (int): Maximum iterations.
+            save_next_hop (bool): Whether to compute next-hop info.
+            device (str): PyTorch device (e.g., "cuda:0", "cpu").
+
+        Returns:
+            Callable: A runner function that performs the simulation.
+        """
+        device = torch.device(device)
+
+        # init matrix
+        size = len(idx2ngbrs)
+        shape = (size, size)
+
+        state = torch.full(shape, 0b00_111111, dtype=torch.uint8, device=device, requires_grad=False).t() # column-major
+        link1 = torch.zeros(shape, dtype=torch.uint8, device=device, requires_grad=False)
+        link2 = torch.full(shape, 0b00_111111, dtype=torch.uint8, device=device, requires_grad=False)
+        link3 = torch.zeros(shape, dtype=torch.uint8, device=device, requires_grad=False)
+
+        tmp0 = torch.empty_like(state) # column-major layout
+        tmp1 = torch.empty_like(state) # column-major layout
+        tmp2 = torch.empty_like(link1)
+        tmp3 = torch.empty_like(link2)
+
+        next_hop = torch.full(shape, -1, dtype=torch.int32, device=device) if save_next_hop else None
+
+        with torch.no_grad():
+            for i, ngbrs in enumerate(idx2ngbrs):
+                state[ngbrs.C2P, i] = 0b11_111110
+                state[ngbrs.P2P, i] = 0b10_111110
+                state[ngbrs.P2C, i] = 0b01_111110
+                link1[i, ngbrs.P2C] = 0b11_000000
+                link1[i, ngbrs.P2P] = 0b10_000000
+                link1[i, ngbrs.C2P] = 0b01_000000
+                link2[i, ngbrs.C2P] = 0b01_111111
+                link3[i, ngbrs.P2C] = 0b00_000001
+                link3[i, ngbrs.P2P] = 0b00_000001
+                link3[i, ngbrs.C2P] = 0b00_000001
+
+        if save_next_hop:
+            def iterate():
+                torch.bitwise_and(state, 0b11_000000, out=tmp0)
+                torch.bitwise_left_shift(tmp0, 1, out=tmp1)
+                torch.bitwise_right_shift(tmp0, 1, out=tmp2[:tmp0.shape[1]].t())
+                torch.bitwise_or(tmp1, tmp2.t()[:, :tmp0.shape[1]], out=tmp1)
+                torch.bitwise_and(tmp1, 0b11_000000, out=tmp1)
+                torch.bitwise_and(tmp0, tmp1, out=tmp0)
+                torch.bitwise_or(tmp1, state, out=tmp1)
+
+                for j in range(state.size(1)):
+                    torch.bitwise_and(link1, tmp0[:, j], out=tmp2)
+                    torch.bitwise_and(link2, tmp1[:, j], out=tmp3)
+                    torch.bitwise_or(tmp2, tmp3, out=tmp2)
+                    tmp2.sub_(link3)
+
+                    max_vals, max_idx = torch.max(tmp2, dim=1)
+                    state[:, j] = max_vals
+                    next_hop[:, j] = max_idx
+        else:
+            def iterate():
+                torch.bitwise_and(state, 0b11_000000, out=tmp0)
+                torch.bitwise_left_shift(tmp0, 1, out=tmp1)
+                torch.bitwise_right_shift(tmp0, 1, out=tmp2[:tmp0.shape[1]].t())
+                torch.bitwise_or(tmp1, tmp2.t()[:, :tmp0.shape[1]], out=tmp1)
+                torch.bitwise_and(tmp1, 0b11_000000, out=tmp1)
+                torch.bitwise_and(tmp0, tmp1, out=tmp0)
+                torch.bitwise_or(tmp1, state, out=tmp1)
+
+                for j in range(state.size(1)):
+                    torch.bitwise_and(link1, tmp0[:, j], out=tmp2)
+                    torch.bitwise_and(link2, tmp1[:, j], out=tmp3)
+                    torch.bitwise_or(tmp2, tmp3, out=tmp2)
+                    tmp2.sub_(link3)
+                    state[:, j] = torch.max(tmp2, dim=1)[0]
+
+        def runner():
+            prev_hash= torch.sum(state.to(torch.int64))
+            for it in range(max_iter):
+                iterate()
+                new_hash= torch.sum(state.to(torch.int64))
+                print(f"Iteration {it+1} completed")
+                if torch.equal(new_hash, prev_hash): # early stop
+                    break
+                prev_hash_before = new_hash
+            return state.cpu().numpy(), next_hop.cpu().numpy() if next_hop is not None else None
+        return runner()
+
+    @staticmethod
+    def __cupy_runner__(idx2ngbrs, max_iter, save_next_hop, device=0):
+        """
+        Prepare and execute simulation on CuPy backend.
+
+        Args:
+            idx2ngbrs (list[RelMap]): Core AS neighbors.
+            max_iter (int): Maximum iterations.
+            save_next_hop (bool): Whether to compute next-hop info.
+            device (int): CuPy device ID (e.g., 0 for "cuda:0").
+
+        Returns:
+            Callable: A runner function that performs the simulation.
+        """
+        pass # TODO
+
     def get_state(self, asn1, asn2):
-        '''Return `(s_type, s_len)`
-           s_type: One of the values from `None`, `C2P`, `P2P` and `P2C`.
-                Return `P2C` if the queried `asn1` and `asn2` are the same.
-           s_len: The length of the path if it exists, i.e., when `s_type`
-                is not `None`. Otherwise, the meaning of `s_len` is undefined.
-        '''
+        """
+        Get the routing relationship and path length between two ASNs.
+
+        This method returns a tuple indicating the route relationship
+        (C2P, P2P, P2C) and the path length from `asn1` to `asn2`. It uses
+        the state matrix computed during the last simulation run.
+
+        **Important caveats:**
+            - Simulation (`run()`) must have been executed before calling this method,
+              otherwise an AssertionError is raised.
+            - If the route from `asn1` to `asn1` does not exist, the result is `(None, 0)`.
+            - If `asn1 == asn2`, the type defaults to `P2C` and length is 0.
+
+        Args:
+            asn1 (str): Source ASN.
+            asn2 (str): Destination ASN.
+
+        Returns:
+            tuple[int | None, int]:
+                - s_type: One of {None, RMatrix.C2P, RMatrix.P2P, RMatrix.P2C}
+                  or None if no route exists.
+                - s_len: Path length if s_type is not None, otherwise undefined (returns 0 here).
+        """
         assert self.has_asn(asn1), f"{asn1} is not in the topology"
         assert self.has_asn(asn2), f"{asn2} is not in the topology"
         assert self.__state__ is not None, f"run simulation to get state matrix first"
@@ -445,13 +676,29 @@ class RMatrix:
         return s_type, s_len
 
     def get_path(self, asn1, asn2):
-        '''Return `path`
-           path: A list of ASNs that form the AS-level path (i.e., AS_path)
-               from `asn1` to `asn2`. `asn1` is not included, while `asn2`
-               is always the tail of the list, if the path exists. Return
-               `None` is the path doesn't exist. Return `[]` if the queired
-               `asn1` and `asn2` are the same.
-        '''
+        """
+        Get the AS-level path (sequence of ASNs) from `asn1` to `asn2`.
+
+        This method returns the explicit AS path derived from the simulation.
+        It uses the next-hop matrix computed during the last simulation run.
+
+        **Important caveats:**
+            - Simulation (`run(save_next_hop=True)`) must have been executed before
+              calling this method, otherwise an AssertionError is raised.
+            - If no route exists between `asn1` and `asn2`, returns `None`.
+            - If `asn1 == asn2`, returns an empty list `[]` because no hops are needed.
+
+        Args:
+            asn1 (str): Source ASN.
+            asn2 (str): Destination ASN.
+
+        Returns:
+            list[str] | None:
+                - A list of ASNs forming the path from `asn1` to `asn2`
+                  (excluding `asn1`, including `asn2`).
+                - `[]` if `asn1 == asn2`.
+                - `None` if no path exists.
+        """
         assert self.has_asn(asn1), f"{asn1} is not in the topology"
         assert self.has_asn(asn2), f"{asn2} is not in the topology"
         assert self.__state__ is not None, f"run simulation to get state matrix first"
@@ -530,8 +777,10 @@ class RMatrix:
         return path
 
     def dump(self, fpath):
+        """Serialize and save the current RMatrix object to a lz4 file."""
         pickle.dump(self, lz4.frame.open(fpath, "wb"), protocol=4)
 
     @staticmethod
     def load(fpath):
+        """Load an RMatrix object from a serialized lz4 file."""
         return pickle.load(lz4.frame.open(fpath, "rb"))
