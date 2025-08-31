@@ -1,192 +1,210 @@
-import numpy as np
 from multiprocessing import RawArray, Pool
 from ctypes import c_ubyte, c_int
+from collections.abc import Iterable, Set, Mapping, Callable, Sequence
+from collections import namedtuple, defaultdict
+import numpy as np
 import lz4.frame
 import pickle
-
-def lz4dump(obj, fpath):
-    pickle.dump(obj, lz4.frame.open(fpath, "wb"), protocol=4)
-
-def lz4load(fpath):
-    return pickle.load(lz4.frame.open(fpath, "rb"))
+import os
 
 class RMatrix:
-    # AS relationship
-    P2C = -1
-    P2P =  0
-    C2P = +1
+    # AS relationship notations
+    # (adhere to CAIDA's norms)
+    P2C = -1 # provider-to-customer
+    P2P =  0 # peer-to-peer
+    C2P = +1 # customer-to-provider
 
-    # non-branch AS information
-    __idx2asn__ = []
-    __asn2idx__ = {}
-    __idx_ngbrs__ = []
+    # RelMap type definition
+    RelMap = namedtuple("RMatrix.RelMap", [
+        "P2P", # accessed by either index  0 or .P2P
+        "C2P", # accessed by either index +1 or .C2P
+        "P2C", # accessed by either index -1 or .P2C
+    ])
 
-    # branch_AS -> {(gateway_AS, distance, branch_id, upstream) ...}
-    __branch2gateway__ = {}
-    __gateway_weights__ = None
-    __gateway_branches__ = None
+    # BranchRoute type definition
+    BranchRoute = namedtuple("RMatrix.BranchRoute", [
+        "root",      # root AS where the branch is connected
+        "next_hop",  # next-hop ASN to the root AS
+        "length",    # number of hops to the root AS
+        "branch_id", # to identify different branches
+    ])
 
-    # shared matrix
+    # shared matrix for multiprocessing in runtime
     __shared_matrix__ = {
         # "state": writable, dtype uint8
-        # "next_hop": writable, dtype int32
-        # "link1": Read-only, dtype uint8
-        # "link2": Read-only, dtype uint8
+        # "next_hop": (optional) writable, dtype int32
+        # "link1": read-only, dtype uint8
+        # "link2": read-only, dtype uint8
     }
 
-    # class init done flag
-    __init_done__ = False
+    # TODO (future): add lock for thread safety?
 
     @staticmethod
-    def asn2idx(asn):
-        return RMatrix.__asn2idx__[asn]
+    def caida_reader(fpath):
+        with open(fpath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    continue
+                asn1, asn2, rel = line.split("|")[:3]
+                rel = int(rel)
+                yield asn1, asn2, rel
 
-    @staticmethod
-    def idx2asn(idx):
-        return RMatrix.__idx2asn__[idx]
+    def __init__(self, input_rels, excluded=None):
+        (
+            # core AS information
+            self.__idx2asn__,
+            self.__asn2idx__,
+            self.__idx2ngbrs__,
 
-    @staticmethod
-    def idx_ngbrs(idx):
-        return RMatrix.__idx_ngbrs__[idx]
+            # branch AS information
+            self.__asn2brts__,
 
-    @staticmethod
-    def asn_in_branch(asn):
-        return asn in RMatrix.__branch2gateway__
+        ) = RMatrix.construct_topology(input_rels, excluded=excluded)
 
-    @staticmethod
-    def get_gateway(asn):
-        return asn if not RMatrix.asn_in_branch(asn) \
-            else RMatrix.__branch2gateway__[asn][0]
-
-    @staticmethod
-    def gateway_weights():
-        if RMatrix.__gateway_weights__ is None:
-            weights = np.ones(len(RMatrix.__idx2asn__), dtype=np.int32)
-            for gw,_,_,_ in RMatrix.__branch2gateway__.values():
-                weights[RMatrix.asn2idx(gw)] += 1
-            RMatrix.__gateway_weights__ = weights
-        return RMatrix.__gateway_weights__
-
-    @staticmethod
-    def gateway_branches():
-        if RMatrix.__gateway_branches__ is None:
-            branches = [set() for _ in range(len(RMatrix.__idx2asn__))]
-            for gw,_,bid,_ in RMatrix.__branch2gateway__.values():
-                branches[RMatrix.asn2idx(gw)].add(bid)
-            RMatrix.__gateway_branches__ = branches
-        return RMatrix.__gateway_branches__
-
-    @staticmethod
-    def has_asn(asn):
-        return asn in RMatrix.__asn2idx__ or asn in RMatrix.__branch2gateway__
-
-    @staticmethod
-    def init_class(as_rel_fpath):
-        if RMatrix.__init_done__:
-            print("Warning: class RMatrix re-inited.")
-            RMatrix.__idx2asn__ = []
-            RMatrix.__asn2idx__ = {}
-            RMatrix.__idx_ngbrs__ = []
-            RMatrix.__branch2gateway__ = {}
-            RMatrix.__shared_matrix__ = {}
-
-        ngbr_map = {}
-        edges = []
-
-        def get_ngbrs(asn):
-            if asn not in ngbr_map:
-                ngbr_map[asn] = {RMatrix.P2C: set(), RMatrix.P2P: set(), RMatrix.C2P: set()}
-            return ngbr_map[asn]
-
-        for l in open(as_rel_fpath, "r").readlines():
-            if l.startswith("#"): continue
-            a, b, r = l.strip().split("|")[:3]
-            rel = int(r)
-
-            edges.append((a, b, rel))
-
-            get_ngbrs(a)[+rel].add(b)
-            get_ngbrs(b)[-rel].add(a)
-
-        def init_idx(asn):
-            if asn not in RMatrix.__asn2idx__:
-                RMatrix.__asn2idx__[asn] = len(RMatrix.__idx2asn__)
-                RMatrix.__idx2asn__.append(asn)
-                RMatrix.__idx_ngbrs__.append({RMatrix.P2C: [], RMatrix.P2P: [], RMatrix.C2P: []})
-            return RMatrix.__asn2idx__[asn]
-
-        branch_id = 0
-        for asn, ngbrs in ngbr_map.items():
-            degree = sum([len(s) for s in ngbrs.values()])
-
-            if degree > 1: # search from stub/dangling AS
-                continue
-
-            branch = []
-            while (len(ngbrs[RMatrix.P2C]) <= 1
-                and len(ngbrs[RMatrix.P2P]) == 0
-                    and len(ngbrs[RMatrix.C2P]) == 1):
-                branch.append(asn)
-                asn, = ngbrs[RMatrix.C2P]
-                ngbrs = ngbr_map[asn]
-
-            init_idx(asn) # init possibly dangling AS 
-            # (note that gateway AS could be dangling after edge pruning)
-
-            for i, branch_as in enumerate(branch[::-1]):
-                upstream = branch[-i] if i > 0 else asn
-                RMatrix.__branch2gateway__[branch_as] = (asn, i+1, branch_id, upstream)
-
-            if branch: branch_id += 1
-
-        e_core = 0
-        for a, b, rel in edges:
-            if RMatrix.asn_in_branch(a) or RMatrix.asn_in_branch(b):
-                continue
-
-            idx_a = init_idx(a)
-            idx_b = init_idx(b)
-
-            RMatrix.idx_ngbrs(idx_a)[+rel].append(idx_b)
-            RMatrix.idx_ngbrs(idx_b)[-rel].append(idx_a)
-            e_core += 1
-
-        n_core = len(RMatrix.__idx2asn__)
-        n = n_core + len(RMatrix.__branch2gateway__)
-        e = len(edges)
-        print(f"class RMatrix init..")
-        print(f"load: {as_rel_fpath}")
-        print(f"nodes: {n:,}")
-        print(f"non-branch nodes: {n_core:,} ({n_core/n:.2%})")
-        print(f"edges: {e:,}")
-        print(f"non-branch edges: {e_core:,} ({e_core/e:.2%})")
-        print(f"branches: {branch_id:,}")
-
-        RMatrix.__init_done__ = True
-
-    def __init__(self, exclude=set()):
-        self.__exclude__ = set()
-        self.__exclude_in_branch__ = set()
-        for asn in exclude:
-            if not RMatrix.has_asn(asn): continue
-            if RMatrix.asn_in_branch(asn):
-                self.__exclude_in_branch__.add(asn)
-            else:
-                self.__exclude__.add(asn)
-        print(f"instance of RMatrix init: "
-              f"{len(self.__exclude__)}/{len(self.__exclude_in_branch__)} ASes excluded.")
-
-        # exlcude indexing
-        self.__exclude_mask__ = np.zeros(len(RMatrix.__idx2asn__), dtype=bool)
-        for asn in self.__exclude__:
-            self.__exclude_mask__[RMatrix.asn2idx(asn)] = True
-        self.__exclude_idx__, = np.where(self.__exclude_mask__)
-
+        # matrix for simulation (init on runtime)
         self.__state__ = None
         self.__next_hop__ = None
 
     @staticmethod
-    def iterate(worker_id, left, right, max_iter):
+    def construct_topology(input_rels, excluded=None):
+        # TODO (future): parallel simulation for disconnected sub-topologies
+        # If the topology has several disconnected areas, assign each with a
+        # single simluation task, so the matrix size can be greatly reduced.
+
+        # construct AS relationships reader
+        if isinstance(input_rels, (str, bytes, os.PathLike)):
+            input_rels = RMatrix.caida_reader(input_rels)
+        else:
+            assert isinstance(input_rels, Iterable), \
+                f"input_rels should be path-like or CAIDA reader: received {type(input_rels)}"
+
+        # construct membership checker for excluded ASes
+        if excluded is None or excluded is False:
+            excluded_check = lambda item: False
+        elif isinstance(excluded, (Set, Mapping)):
+            excluded_check = lambda item: item in excluded
+        elif isinstance(container, Sequence) and not isinstance(container, str):
+            excluded_check = lambda item: item in set(container)
+        else:
+            assert isinstance(excluded, Callable), \
+                f"excluded should be Callable or container for membership check: received {type(excluded)}"
+            excluded_check = excluded
+
+        # construct neighbors and edges
+        asn2ngbrs = defaultdict(lambda: RMatrix.RelMap(set(), set(), set()))
+        edges = list()
+
+        for asn1, asn2, rel in input_rels:
+            if excluded_check(asn1) or excluded_check(asn2): # ignore those excluded
+                continue
+            edges.append((asn1, asn2, rel))
+            asn2ngbrs[asn1][+rel].add(asn2) # asn1 -> asn2: +rel
+            asn2ngbrs[asn2][-rel].add(asn1) # asn2 -> asn1: -rel
+
+        # find all branches
+        asn2brts = dict() # branch AS -> branch route
+        branch_id = 0
+        for asn, (peers, providers, customers) in asn2ngbrs.items(): # see RelMap definition
+            # search from stub/dangling AS
+            if len(customers) != 0 or len(peers) != 0 or len(providers) > 1:
+                continue 
+
+            # TODO (future): optimization for stub-peering ASes
+            # (i.e., those with no customer/provider but 1 peer)
+            # Routing tables of stub-peering ASes can be directly derived from their peers,
+            # so they can be excluded from the core network too for simulation efficiency.
+
+            branch = []
+            while (len(customers) <= 1
+                    and len(peers) == 0
+                        and len(providers) == 1): # search all the way up
+                branch.append(asn)
+
+                # go to the only provider
+                asn, = providers 
+                peers, providers, customers = asn2ngbrs[asn]
+
+            # if this whole sub-tree is dangling (disconnected from the core network)
+            if len(providers) == 0 and len(peers) == 0: 
+                # it might still have multiple customers, thus forming a sub-tree,
+                # and asn is the root (it could also be a single dangling AS).
+                # Add a self-pointing branch route for it so it will not be included
+                # in the core network later, which improves simulation efficiency.
+                asn2brts[asn] = RMatrix.BranchRoute(
+                        root=asn, next_hop=None, length=0, branch_id=None)
+
+            for i, branch_as in enumerate(branch[::-1]):
+                upstream = branch[-i] if i > 0 else asn
+                asn2brts[branch_as] = RMatrix.BranchRoute(
+                        root=asn, next_hop=upstream, length=i+1, branch_id=branch_id)
+
+            # A branch route means: {branch_as} can follow {next_hop} all the way up
+            # along the branch, and after {length} hops, it can finally reach a root
+            # AS, which can be either a core AS or the root of a dangling sub-tree.
+            branch_id += 1
+
+        # construct core networks
+        idx2asn = list()
+        asn2idx = dict()
+        idx2ngbrs = list()
+
+        def init_core(asn):
+            if asn not in asn2idx:
+                asn2idx[asn] = len(idx2asn)
+                idx2asn.append(asn)
+                idx2ngbrs.append(RMatrix.RelMap(list(), list(), list()))
+            return asn2idx[asn]
+
+        num_core_edges = 0
+        for asn1, asn2, rel in edges:
+            # init index for core ASes
+            idx1 = init_core(asn1) if asn1 not in asn2brts else None
+            idx2 = init_core(asn2) if asn2 not in asn2brts else None
+
+            if idx1 is None or idx2 is None:
+                continue
+
+            # add core edges
+            idx2ngbrs[idx1][+rel].append(idx2)
+            idx2ngbrs[idx2][-rel].append(idx1)
+            num_core_edges += 1
+
+        num_core_nodes = len(idx2asn)
+        num_nodes = num_core_nodes + len(asn2brts)
+        num_edges = len(edges)
+        print(f"Topology constructed")
+        print(f"load: {input_rels}")
+        print(f"nodes: {num_nodes:,}")
+        print(f"core nodes: {num_core_nodes:,} ({num_core_nodes/num_nodes:.2%})")
+        print(f"edges: {num_edges:,}")
+        print(f"core edges: {num_core_edges:,} ({num_core_edges/num_edges:.2%})")
+
+        return idx2asn, asn2idx, idx2ngbrs, asn2brts
+
+    def asn2idx(self, asn):
+        return self.__asn2idx__[asn]
+
+    def idx2asn(self, idx):
+        return self.__idx2asn__[idx]
+
+    def idx2ngbrs(self, idx):
+        return self.__idx2ngbrs__[idx]
+
+    def asn2brts(self, asn):
+        return self.__asn2brts__[asn]
+
+    def is_core_asn(self, asn):
+        return asn in self.__asn2idx__
+
+    def is_branch_asn(self, asn):
+        return asn in self.__asn2brts__
+
+    def has_asn(self, asn):
+        return self.is_core_asn(asn) or self.is_branch_asn(asn)
+
+    @staticmethod
+    def __iterate_state_cpu__(worker_id, left, right, max_iter):
         shared = RMatrix.__shared_matrix__
 
         state = np.frombuffer(
@@ -229,7 +247,7 @@ class RMatrix:
                 break
 
     @staticmethod
-    def iterate2(worker_id, left, right, max_iter):
+    def __iterate_state_and_next_hop_cpu__(worker_id, left, right, max_iter):
         shared = RMatrix.__shared_matrix__
 
         state = np.frombuffer(
@@ -276,157 +294,49 @@ class RMatrix:
             if finish_flag.all():
                 break
 
-        # manually set to -1
-        next_hop[:, left:right][state[:, left:right] <= 0b00_111111] = -1 
+        # where no route is available, the next-hop is manually set to -1
+        next_hop[:, left:right][state[:, left:right] <= 0b00_111111] = -1
 
-    def run(self, n_jobs=1, max_iter=30, record_next_hop=False):
-        f_size = len(RMatrix.__idx2asn__) # full size
-        p_size = f_size - len(self.__exclude__) # partial size
-
-        exclude_mask = self.__exclude_mask__
-        exclude_idx = self.__exclude_idx__
-
-        # remap indexing
-        full2partial = np.arange(f_size)
-        for i in exclude_idx:
-            full2partial[i:] -= 1
-        full2partial[exclude_mask] = -1
-
-        idx_ngbrs = [dict() for _ in range(p_size)]
-        for i, __ngbrs__ in enumerate(RMatrix.__idx_ngbrs__):
-            i = full2partial[i]
-            if i == -1: continue
-            for rel, __ngbr_list__ in __ngbrs__.items():
-                idx_ngbrs[i][rel] = np.setdiff1d(full2partial[__ngbr_list__], [-1])
-        print(f"remap indexing done")
-
-        # init matrix
-        shape = (p_size, p_size)
-
-        state = RawArray(c_ubyte, shape[0]*shape[1]) # shared
-        state_np = np.frombuffer(state, dtype=np.uint8).reshape(shape, order="F")
-        state_np[:] = 0b00_111111
-        for i, ngbrs in enumerate(idx_ngbrs):
-            state_np[ngbrs[RMatrix.C2P], i] = 0b11_111110
-            state_np[ngbrs[RMatrix.P2P], i] = 0b10_111110
-            state_np[ngbrs[RMatrix.P2C], i] = 0b01_111110
-        state_np[np.arange(p_size), np.arange(p_size)] = 0b11_111111
-        print(f"state matrix constructed")
-
-        link1 = RawArray(c_ubyte, shape[0]*shape[1]) # shared
-        link1_np = np.frombuffer(link1, dtype=np.uint8).reshape(shape, order="C")
-        for i, ngbrs in enumerate(idx_ngbrs):
-            link1_np[i, ngbrs[RMatrix.P2C]] = 0b11_000000
-            link1_np[i, ngbrs[RMatrix.P2P]] = 0b10_000000
-            link1_np[i, ngbrs[RMatrix.C2P]] = 0b01_000000
-        print(f"link1 matrix constructed")
-
-        link2 = RawArray(c_ubyte, shape[0]*shape[1]) # shared
-        link2_np = np.frombuffer(link2, dtype=np.uint8).reshape(shape, order="C")
-        link2_np[:] = 0b00_111111
-        for i, ngbrs in enumerate(idx_ngbrs):
-            link2_np[i, ngbrs[RMatrix.C2P]] = 0b01_111111
-        print(f"link2 matrix constructed")
-
-        if record_next_hop:
-            next_hop = RawArray(c_int, shape[0]*shape[1])
-            next_hop_np = np.frombuffer(next_hop, dtype=np.int32).reshape(shape, order="F")
-            next_hop_np[:] = -1
-            print(f"next_hop matrix constructed")
-
-        # split for parallel tasks
-        assert n_jobs >= 1
-        split = np.linspace(0, p_size, n_jobs+1).astype(int)
-        print(f"start running with {n_jobs} processes.")
-
-        if record_next_hop:
-            def initializer(state, link1, link2, next_hop, shape):
-                RMatrix.__shared_matrix__["state"] = state
-                RMatrix.__shared_matrix__["link1"] = link1
-                RMatrix.__shared_matrix__["link2"] = link2
-                RMatrix.__shared_matrix__["next_hop"] = next_hop
-                RMatrix.__shared_matrix__["shape"] = shape
-
-            initargs = (state, link1, link2, next_hop, shape)
-
-            params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
-
-            with Pool(processes=n_jobs, initializer=initializer,
-                    initargs=initargs) as pool:
-                pool.starmap(RMatrix.iterate2, params)
-            self.__state__ = RMatrix.expand_to_full_state(state_np, exclude_mask)
-            self.__next_hop__ = RMatrix.expand_to_full_next_hop(next_hop_np, exclude_idx)
-        else:
-            def initializer(state, link1, link2, shape):
-                RMatrix.__shared_matrix__["state"] = state
-                RMatrix.__shared_matrix__["link1"] = link1
-                RMatrix.__shared_matrix__["link2"] = link2
-                RMatrix.__shared_matrix__["shape"] = shape
-
-            initargs = (state, link1, link2, shape)
-
-            params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
-
-            with Pool(processes=n_jobs, initializer=initializer,
-                    initargs=initargs) as pool:
-                pool.starmap(RMatrix.iterate, params)
-
-            self.__state__ = RMatrix.expand_to_full_state(state_np, exclude_mask)
-            self.__next_hop__ = None
-
+    def run(self, n_jobs=1, max_iter=32, save_next_hop=True):
+        RMatrix.__cpu_runner__(self.__idx2ngbrs__, n_jobs, max_iter, save_next_hop)()
+        self.__state__ = RMatrix.__shared_matrix__.pop("state", None)
+        self.__next_hop__ = RMatrix.__shared_matrix__.pop("next_hop", None)
         RMatrix.__shared_matrix__ = {}
         return self
 
-    def update_runner(self, n_jobs=1, max_iter=30, record_next_hop=False):
-        f_size = len(RMatrix.__idx2asn__) # full size
-        p_size = f_size - len(self.__exclude__) # partial size
-
-        exclude_mask = self.__exclude_mask__
-        exclude_idx = self.__exclude_idx__
-
-        # remap indexing
-        full2partial = np.arange(f_size)
-        for i in exclude_idx:
-            full2partial[i:] -= 1
-        full2partial[exclude_mask] = -1
-
-        idx_ngbrs = [dict() for _ in range(p_size)]
-        for i, __ngbrs__ in enumerate(RMatrix.__idx_ngbrs__):
-            i = full2partial[i]
-            if i == -1: continue
-            for rel, __ngbr_list__ in __ngbrs__.items():
-                idx_ngbrs[i][rel] = np.setdiff1d(full2partial[__ngbr_list__], [-1])
-        print(f"remap indexing done")
-
+    @staticmethod
+    def __cpu_runner__(idx2ngbrs, n_jobs, max_iter, save_next_hop):
         # init matrix
-        shape = (p_size, p_size)
+        size = len(idx2ngbrs)
+        shape = (size, size)
 
-        state = RawArray(c_ubyte, shape[0]*shape[1]) # shared
-        state_np = np.frombuffer(state, dtype=np.uint8).reshape(shape, order="F")
+        state = RawArray(c_ubyte, shape[0]*shape[1]) # shared raw array
+        state_np = np.frombuffer(state, dtype=np.uint8).reshape(shape, order="F") # numpy interface
         state_np[:] = 0b00_111111
-        for i, ngbrs in enumerate(idx_ngbrs):
-            state_np[ngbrs[RMatrix.C2P], i] = 0b11_111110
-            state_np[ngbrs[RMatrix.P2P], i] = 0b10_111110
-            state_np[ngbrs[RMatrix.P2C], i] = 0b01_111110
-        state_np[np.arange(p_size), np.arange(p_size)] = 0b11_111111
+        for i, ngbrs in enumerate(idx2ngbrs):
+            state_np[ngbrs.C2P, i] = 0b11_111110 # one-hop route to providers
+            state_np[ngbrs.P2P, i] = 0b10_111110 # one-hop route to peers
+            state_np[ngbrs.P2C, i] = 0b01_111110 # one-hop route to customers
+        state_np[np.arange(size), np.arange(size)] = 0b11_111111 # self-pointing route
         print(f"state matrix constructed")
 
-        link1 = RawArray(c_ubyte, shape[0]*shape[1]) # shared
+        link1 = RawArray(c_ubyte, shape[0]*shape[1])
         link1_np = np.frombuffer(link1, dtype=np.uint8).reshape(shape, order="C")
-        for i, ngbrs in enumerate(idx_ngbrs):
-            link1_np[i, ngbrs[RMatrix.P2C]] = 0b11_000000
-            link1_np[i, ngbrs[RMatrix.P2P]] = 0b10_000000
-            link1_np[i, ngbrs[RMatrix.C2P]] = 0b01_000000
+        for i, ngbrs in enumerate(idx2ngbrs):
+            link1_np[i, ngbrs.P2C] = 0b11_000000
+            link1_np[i, ngbrs.P2P] = 0b10_000000
+            link1_np[i, ngbrs.C2P] = 0b01_000000
         print(f"link1 matrix constructed")
 
-        link2 = RawArray(c_ubyte, shape[0]*shape[1]) # shared
+        link2 = RawArray(c_ubyte, shape[0]*shape[1])
         link2_np = np.frombuffer(link2, dtype=np.uint8).reshape(shape, order="C")
         link2_np[:] = 0b00_111111
-        for i, ngbrs in enumerate(idx_ngbrs):
-            link2_np[i, ngbrs[RMatrix.C2P]] = 0b01_111111
+        for i, ngbrs in enumerate(idx2ngbrs):
+            link2_np[i, ngbrs.C2P] = 0b01_111111
         print(f"link2 matrix constructed")
 
-        if record_next_hop:
+        # TODO (future): try use c_uint16 for efficiency if core ASes are fewer than 65536
+        if save_next_hop:
             next_hop = RawArray(c_int, shape[0]*shape[1])
             next_hop_np = np.frombuffer(next_hop, dtype=np.int32).reshape(shape, order="F")
             next_hop_np[:] = -1
@@ -434,10 +344,10 @@ class RMatrix:
 
         # split for parallel tasks
         assert n_jobs >= 1
-        split = np.linspace(0, p_size, n_jobs+1).astype(int)
+        split = np.linspace(0, size, n_jobs+1).astype(int)
         print(f"runner with {n_jobs} processes.")
 
-        if record_next_hop:
+        if save_next_hop:
             def runner():
                 def initializer(state, link1, link2, next_hop, shape):
                     RMatrix.__shared_matrix__["state"] = state
@@ -452,7 +362,7 @@ class RMatrix:
 
                 with Pool(processes=n_jobs, initializer=initializer,
                         initargs=initargs) as pool:
-                    pool.starmap(RMatrix.iterate2, params)
+                    pool.starmap(RMatrix.__iterate_state_and_next_hop_cpu__, params)
         else:
             def runner():
                 def initializer(state, link1, link2, shape):
@@ -467,7 +377,8 @@ class RMatrix:
 
                 with Pool(processes=n_jobs, initializer=initializer,
                         initargs=initargs) as pool:
-                    pool.starmap(RMatrix.iterate, params)
+                    pool.starmap(RMatrix.__iterate_state_cpu__, params)
+
         return runner
 
     def get_state(self, asn1, asn2):
@@ -477,51 +388,59 @@ class RMatrix:
            s_len: The length of the path if it exists, i.e., when `s_type`
                 is not `None`. Otherwise, the meaning of `s_len` is undefined.
         '''
-        if not (self.has_asn(asn1) and self.has_asn(asn2)):
-            return None, 0b00_111111
+        assert self.has_asn(asn1), f"{asn1} is not in the topology"
+        assert self.has_asn(asn2), f"{asn2} is not in the topology"
+        assert self.__state__ is not None, f"run simulation to get state matrix first"
 
-        def get_state_in_matrix(asn1, asn2):
+        def decode_state_from_matrix(asn1, asn2):
             s = self.__state__[self.asn2idx(asn1), self.asn2idx(asn2)]
             s_type = [None, RMatrix.C2P, RMatrix.P2P, RMatrix.P2C][s >> 6]
             s_len = 0b00_111111 - (s & 0b00_111111)
             return s_type, s_len
 
-        if asn1 in self.__branch2gateway__:
-            gw1, dist1, bid1, _ = self.__branch2gateway__[asn1]
-            if asn2 in self.__branch2gateway__:
-                gw2, dist2, bid2, _ = self.__branch2gateway__[asn2]
-                if bid1 == bid2: # in the same branch
-                    s_type = RMatrix.C2P if dist1 > dist2 else RMatrix.P2C
-                    s_len = abs(dist1-dist2)
-                # must pass through gw1/gw2 then
-                elif gw1 in self.__exclude__ or gw2 in self.__exclude__:
-                    s_type, s_len = None, 0b00_111111
-                else:
-                    s_type, s_len = get_state_in_matrix(gw1, gw2)
+        if self.is_branch_asn(asn1): # asn1 is branch AS
+            brts1 = self.asn2brts(asn1)
+            if self.is_branch_asn(asn2): # asn2 is branch AS too
+                brts2 = self.asn2brts(asn2)
+                if brts1.root == brts2.root: # in the same sub-tree
+                    if brts1.branch_id == brts2.branch_id: # in the same branch (or both are root)
+                        s_type = RMatrix.C2P if brts1.length > brts2.length else RMatrix.P2C
+                        s_len = abs(brts1.length - brts2.length)
+                    else: # in different branches (or one is root)
+                        s_type = RMatrix.C2P if brts1.length > 0 else RMatrix.P2C
+                        s_len = brts1.length + brts2.length
+                else: # in different sub-trees
+                    if self.is_core_asn(brts1.root) and self.is_core_asn(brts2.root):
+                        # both branches are connected to the core network
+                        s_type, s_len = decode_state_from_matrix(brts1.root, brts2.root)
+                        if s_type is not None:
+                            s_type = RMatrix.C2P
+                            s_len += brts1.length
+                            s_len += brts2.length
+                    else: # at least one sub-tree is disconnected from the core network
+                        s_type = None
+                        s_len = 0
+            else: # asn2 is core AS
+                if self.is_core_asn(brts1.root): # branch is connected to the core network
+                    s_type, s_len = decode_state_from_matrix(brts1.root, asn2)
                     if s_type is not None:
                         s_type = RMatrix.C2P
-                        s_len += dist1
-                        s_len += dist2
-            # must pass through gw1 then
-            elif gw1 in self.__exclude__:
-                s_type, s_len = None, 0b00_111111
-            else:
-                s_type, s_len = get_state_in_matrix(gw1, asn2)
-                if s_type is not None:
-                    s_type = RMatrix.C2P
-                    s_len += dist1
-        else:
-            if asn2 in self.__branch2gateway__:
-                gw2, dist2, bid2, _ = self.__branch2gateway__[asn2]
-                # must pass through gw2 then
-                if gw2 in self.__exclude__:
-                    s_type, s_len = None, 0b00_111111
-                else:
-                    s_type, s_len = get_state_in_matrix(asn1, gw2)
+                        s_len += brts1.length
+                else: # sub-tree is disconnected from the core network
+                    s_type = None
+                    s_len = 0
+        else: # asn1 is core AS
+            if self.is_branch_asn(asn2): # asn2 is branch AS
+                brts2 = self.asn2brts(asn2)
+                if self.is_core_asn(brts2.root): # branch is connected to the core network
+                    s_type, s_len = decode_state_from_matrix(asn1, brts2.root)
                     if s_type is not None:
-                        s_len += dist2
-            else:
-                s_type, s_len = get_state_in_matrix(asn1, asn2)
+                        s_len += brts2.length
+                else: # sub-tree is disconnected from the core network
+                    s_type = None
+                    s_len = 0
+            else: # asn2 is core AS too
+                s_type, s_len = decode_state_from_matrix(asn1, asn2)
 
         return s_type, s_len
 
@@ -533,12 +452,13 @@ class RMatrix:
                `None` is the path doesn't exist. Return `[]` if the queired
                `asn1` and `asn2` are the same.
         '''
-        assert self.__next_hop__ is not None
+        assert self.has_asn(asn1), f"{asn1} is not in the topology"
+        assert self.has_asn(asn2), f"{asn2} is not in the topology"
+        assert self.__state__ is not None, f"run simulation to get state matrix first"
+        assert self.__next_hop__ is not None, \
+                f"run simulation with save_next_hop=True to get next_hop matrix first"
 
-        if not (self.has_asn(asn1) and self.has_asn(asn2)):
-            return None
-
-        def get_path_in_matrix(asn1, asn2):
+        def decode_path_from_matrix(asn1, asn2):
             src_idx = self.asn2idx(asn1)
             dst_idx = self.asn2idx(asn2)
             path = []
@@ -550,113 +470,68 @@ class RMatrix:
                 path.append(self.idx2asn(src_idx))
             return path
 
-        if asn1 in self.__branch2gateway__:
-            gw1, dist1, bid1, _ = self.__branch2gateway__[asn1]
-            if asn2 in self.__branch2gateway__:
-                gw2, dist2, bid2, _ = self.__branch2gateway__[asn2]
-                if bid1 == bid2: # in the same branch
-                    if dist1 > dist2:
-                        path = []
-                        ups = asn1
-                        while ups != asn2:
-                            _, _, _, ups = self.__branch2gateway__[ups]
-                            path.append(ups)
-                    else:
-                        path = []
-                        ups = asn2
-                        while ups != asn1:
-                            path.append(ups)
-                            _, _, _, ups = self.__branch2gateway__[ups]
-                        path = path[::-1]
-                # must pass through gw1/gw2 then
-                elif gw1 in self.__exclude__ or gw2 in self.__exclude__:
-                    path = None
-                else:
-                    path = get_path_in_matrix(gw1, gw2)
-                    if path is not None:
-                        path1 = []
-                        ups = asn1
-                        while ups in self.__branch2gateway__:
-                            _, _, _, ups = self.__branch2gateway__[ups]
-                            path1.append(ups)
+        def up_branch_search(asn1, asn2):
+            path = []
+            traveler = asn1
+            while traveler != asn2:
+                traveler = self.asn2brts(traveler).next_hop
+                path.append(traveler)
+            return path
 
-                        path2 = []
-                        ups = asn2
-                        while ups in self.__branch2gateway__:
-                            path2.append(ups)
-                            _, _, _, ups = self.__branch2gateway__[ups]
+        def down_branch_search(asn1, asn2):
+            path = []
+            traveler = asn2
+            while traveler != asn1:
+                path.append(traveler) # append it first as it is reverse-searching
+                traveler = self.asn2brts(traveler).next_hop
+            return path[::-1] # reverse back
 
-                        path = path1 + path + path2[::-1]
-            # must pass through gw1 then
-            elif gw1 in self.__exclude__:
-                path = None
-            else:
-                path = get_path_in_matrix(gw1, asn2)
-                if path is not None:
-                    path1 = []
-                    ups = asn1
-                    while ups in self.__branch2gateway__:
-                        _, _, _, ups = self.__branch2gateway__[ups]
-                        path1.append(ups)
-                    path = path1 + path
-        else:
-            if asn2 in self.__branch2gateway__:
-                gw2, dist2, bid2, _ = self.__branch2gateway__[asn2]
-                # must pass through gw2 then
-                if gw2 in self.__exclude__:
-                    path = None
-                else:
-                    path = get_path_in_matrix(asn1, gw2)
+        if self.is_branch_asn(asn1): # asn1 is branch AS
+            brts1 = self.asn2brts(asn1)
+            if self.is_branch_asn(asn2): # asn2 is branch AS too
+                brts2 = self.asn2brts(asn2)
+                if brts1.root == brts2.root: # in the same sub-tree
+                    if brts1.branch_id == brts2.branch_id: # in the same branch (or both are root)
+                        if brts1.length > brts2.length: # asn1 is lower
+                            path = up_branch_search(asn1, asn2)
+                        else: # asn1 == asn2 or asn2 is lower
+                            path = down_branch_search(asn1, asn2)
+                    else: # in different branches (or one is root)
+                        path = up_branch_search(asn1, brts1.root)
+                        path += down_branch_search(brts2.root, asn2)
+                else: # in differnet sub-trees
+                    if self.is_core_asn(brts1.root) and self.is_core_asn(brts2.root):
+                        # both branches are connected to the core network
+                        path = decode_path_from_matrix(brts1.root, brts2.root)
+                        if path is not None:
+                            path = up_branch_search(asn1, brts1.root) + path
+                            path += down_branch_search(brts2.root, asn2)
+                    else: # at least one sub-tree is disconnected from the core network
+                        path = None
+            else: # asn2 is core AS
+                if self.is_core_asn(brts1.root): # branch is connected to the core network
+                    path = decode_path_from_matrix(brts1.root, asn2)
                     if path is not None:
-                        path2 = []
-                        ups = asn2
-                        while ups in self.__branch2gateway__:
-                            path2.append(ups)
-                            _, _, _, ups = self.__branch2gateway__[ups]
-                        path = path + path2[::-1]
-            else:
-                path = get_path_in_matrix(asn1, asn2)
+                        path = up_branch_search(asn1, brts1.root) + path
+                else: # sub-tree is disconnected from the core network
+                    path = None
+        else: # asn1 is core AS
+            if self.is_branch_asn(asn2): # asn2 is branch AS
+                brts2 = self.asn2brts(asn2)
+                if self.is_core_asn(brts2.root): # branch is connected to the core network
+                    path = decode_path_from_matrix(asn1, brts2.root)
+                    if path is not None:
+                        path += down_branch_search(brts2.root, asn2)
+                else: # sub-tree is disconnected from the core network
+                    path = None
+            else: # asn2 is core AS too
+                path = decode_path_from_matrix(asn1, asn2)
 
         return path
 
-    @staticmethod
-    def expand_to_full_state(state, exclude_idx):
-        f_size = len(RMatrix.__idx2asn__)
-        f_state = np.full((f_size, f_size), 0b00_111111, dtype=np.uint8)
-        f_state[exclude_idx, exclude_idx] = 0b11_111111
-
-        include_2d_mask = np.ones((f_size, f_size), dtype=bool)
-        include_2d_mask[exclude_idx] = False
-        include_2d_mask[:, exclude_idx] = False
-
-        f_state[include_2d_mask] = state.ravel()
-        return f_state
-
-    @staticmethod
-    def expand_to_full_next_hop(next_hop, exclude_idx, remap=True):
-        f_size = len(RMatrix.__idx2asn__)
-        f_next_hop = np.full((f_size, f_size), -1, dtype=np.int32)
-
-        if remap:
-            partial2full = list(range(f_size))
-            for i in sorted(exclude_idx)[::-1]:
-                partial2full.pop(i)
-            partial2full.append(-1) # index -1 keeps to -1
-            partial2full = np.array(partial2full)
-            for row in next_hop: # processing by row to reduce memory usage spike
-                row[:] = partial2full[row]
-
-        include_2d_mask = np.ones((f_size, f_size), dtype=bool)
-        include_2d_mask[exclude_idx] = False
-        include_2d_mask[:, exclude_idx] = False
-
-        f_next_hop[include_2d_mask] = next_hop.ravel()
-        return f_next_hop
-
     def dump(self, fpath):
-        lz4dump(self, fpath)
+        pickle.dump(self, lz4.frame.open(fpath, "wb"), protocol=4)
 
     @staticmethod
     def load(fpath):
-        assert RMatrix.__init_done__, "init class before load instances"
-        return lz4load(fpath)
+        return pickle.load(lz4.frame.open(fpath, "rb"))
