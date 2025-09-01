@@ -379,7 +379,7 @@ class RMatrix:
             runner = RMatrix.__cpu_runner__(self.__idx2ngbrs__, n_jobs, max_iter, save_next_hop)
         elif backend == "torch":
             try:
-                import torch
+                globals()["torch"] = __import__("torch")
             except ImportError:
                 raise ImportError("Torch backend requires PyTorch. Install with `pip install matrix-bgpsim[torch]`.")
             if device is None:
@@ -387,12 +387,11 @@ class RMatrix:
             runner = RMatrix.__torch_runner__(self.__idx2ngbrs__, max_iter, save_next_hop, device)
         elif backend == "cupy":
             try:
-                import cupy as cp
+                globals()["cp"] = __import__("cupy")
             except ImportError:
                 raise ImportError("CuPy backend requires CuPy. Install with `pip install matrix-bgpsim[cupy]`.")
             if device is None:
                 device = 0 # CuPy uses integer device IDs
-            cp.cuda.Device(device).use()
             runner = RMatrix.__cupy_runner__(self.__idx2ngbrs__, max_iter, save_next_hop, device)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -517,7 +516,7 @@ class RMatrix:
         tmp3 = torch.empty_like(link2)
 
         next_hop = torch.full(shape, -1, dtype=torch.int32,
-                        device=device).t() if save_next_hop else None
+                        device=device, requires_grad=False).t() if save_next_hop else None
 
         # initialize state and link matrices
         with torch.no_grad():
@@ -563,18 +562,20 @@ class RMatrix:
                     state[:, j] = torch.max(tmp2, dim=1)[0].sub_(1)
 
         def runner():
-            prev_hash = torch.sum(state, dtype=torch.int64)
-            for it in range(max_iter):
-                iterate()
-                new_hash = torch.sum(state, dtype=torch.int64)
-                print(f"Iteration {it+1} completed")
-                if torch.equal(new_hash, prev_hash): # early stop
-                    break
-                prev_hash = new_hash
-            if next_hop is not None:
-                next_hop[state <= 0b00_111111] = -1
+            with torch.no_grad():
+                prev_hash = torch.sum(state, dtype=torch.int64)
+                for it in range(max_iter):
+                    iterate()
+                    new_hash = torch.sum(state, dtype=torch.int64)
+                    print(f"Iteration {it+1} completed")
+                    if torch.equal(new_hash, prev_hash): # early stop
+                        break
+                    prev_hash = new_hash
+                if next_hop is not None:
+                    next_hop[state <= 0b00_111111] = -1
                 # TODO (future): write a custom CUDA kernel to reduce the mask tensor here
             return state.cpu().numpy(), next_hop.cpu().numpy() if next_hop is not None else None
+
         return runner()
 
     @staticmethod
@@ -591,7 +592,75 @@ class RMatrix:
         Returns:
             Callable: A runner function that performs the simulation.
         """
-        pass # TODO
+        with cp.cuda.Device(device):
+            size = len(idx2ngbrs)
+            shape = (size, size)
+
+            # pre-allocate all matrices with proper memory layout
+            state = cp.full(shape, 0b00_111111, dtype=cp.uint8).T  # column-major
+            link1 = cp.zeros(shape, dtype=cp.uint8)
+            link2 = cp.full(shape, 0b00_111111, dtype=cp.uint8)
+
+            tmp0 = cp.empty_like(state)
+            tmp1 = cp.empty_like(state)
+            tmp2 = cp.empty_like(link1)
+            tmp3 = cp.empty_like(link2)
+
+            next_hop = cp.full(shape, -1, dtype=cp.int32).T if save_next_hop else None
+
+            # initialize state and link matrices
+            for i, ngbrs in enumerate(idx2ngbrs):
+                state[ngbrs.C2P, i] = 0b11_111110
+                state[ngbrs.P2P, i] = 0b10_111110
+                state[ngbrs.P2C, i] = 0b01_111110
+                link1[i, ngbrs.P2C] = 0b11_000000
+                link1[i, ngbrs.P2P] = 0b10_000000
+                link1[i, ngbrs.C2P] = 0b01_000000
+                link2[i, ngbrs.C2P] = 0b01_111111
+
+            # the preparation step called before updating state/next_hop
+            def pre_update():
+                cp.bitwise_and(state, 0b11_000000, out=tmp0)
+                cp.left_shift(tmp0, 1, out=tmp1)
+                cp.right_shift(tmp0.T, 1, out=tmp2)
+                cp.bitwise_or(tmp1, tmp2.T, out=tmp1)
+                cp.bitwise_and(tmp1, 0b11_000000, out=tmp1)
+                cp.bitwise_and(tmp0, tmp1, out=tmp0)
+                cp.bitwise_or(tmp1, state, out=tmp1)
+
+            if save_next_hop:
+                def iterate():
+                    pre_update()
+                    for j in range(state.shape[1]):
+                        cp.bitwise_and(link1, tmp0[:, j], out=tmp2)
+                        cp.bitwise_and(link2, tmp1[:, j], out=tmp3)
+                        cp.bitwise_or(tmp2, tmp3, out=tmp2)
+
+                        state[:, j] = cp.max(tmp2, axis=1) - 1
+                        next_hop[:, j] = cp.argmax(tmp2, axis=1)
+            else:
+                def iterate():
+                    pre_update()
+                    for j in range(state.shape[1]):
+                        cp.bitwise_and(link1, tmp0[:, j], out=tmp2)
+                        cp.bitwise_and(link2, tmp1[:, j], out=tmp3)
+                        cp.bitwise_or(tmp2, tmp3, out=tmp2)
+                        state[:, j] = cp.max(tmp2, axis=1) - 1
+
+            def runner():
+                prev_hash = cp.sum(state, dtype=cp.int64)
+                for it in range(max_iter):
+                    iterate()
+                    new_hash = cp.sum(state, dtype=cp.int64)
+                    print(f"Iteration {it+1} completed")
+                    if cp.array_equal(new_hash, prev_hash):  # early stop
+                        break
+                    prev_hash = new_hash
+                if next_hop is not None:
+                    next_hop[state <= 0b00_111111] = -1
+                return state.get(), next_hop.get() if next_hop is not None else None
+
+            return runner()
 
     def get_state(self, asn1, asn2):
         """
