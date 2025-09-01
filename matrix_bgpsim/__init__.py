@@ -502,22 +502,24 @@ class RMatrix:
         """
         device = torch.device(device)
 
-        # init matrix
+        # pre-allocate all matrices with proper memory layout
         size = len(idx2ngbrs)
         shape = (size, size)
 
-        state = torch.full(shape, 0b00_111111, dtype=torch.uint8, device=device, requires_grad=False).t() # column-major
+        state = torch.full(shape, 0b00_111111, dtype=torch.uint8,
+                    device=device, requires_grad=False).t() # column-major
         link1 = torch.zeros(shape, dtype=torch.uint8, device=device, requires_grad=False)
         link2 = torch.full(shape, 0b00_111111, dtype=torch.uint8, device=device, requires_grad=False)
-        link3 = torch.zeros(shape, dtype=torch.uint8, device=device, requires_grad=False)
 
-        tmp0 = torch.empty_like(state) # column-major layout
-        tmp1 = torch.empty_like(state) # column-major layout
+        tmp0 = torch.empty_like(state) # column-major: assert tmp0.stride(0) == 1
+        tmp1 = torch.empty_like(state) # column-major: assert tmp1.stride(0) == 1
         tmp2 = torch.empty_like(link1)
         tmp3 = torch.empty_like(link2)
 
-        next_hop = torch.full(shape, -1, dtype=torch.int32, device=device) if save_next_hop else None
+        next_hop = torch.full(shape, -1, dtype=torch.int32,
+                        device=device).t() if save_next_hop else None
 
+        # initialize state and link matrices
         with torch.no_grad():
             for i, ngbrs in enumerate(idx2ngbrs):
                 state[ngbrs.C2P, i] = 0b11_111110
@@ -527,55 +529,51 @@ class RMatrix:
                 link1[i, ngbrs.P2P] = 0b10_000000
                 link1[i, ngbrs.C2P] = 0b01_000000
                 link2[i, ngbrs.C2P] = 0b01_111111
-                link3[i, ngbrs.P2C] = 0b00_000001
-                link3[i, ngbrs.P2P] = 0b00_000001
-                link3[i, ngbrs.C2P] = 0b00_000001
+
+        # the preparation step called before updating state/next_hop
+        def pre_update():
+            torch.bitwise_and(state, 0b11_000000, out=tmp0)
+            torch.bitwise_left_shift(tmp0, 1, out=tmp1)
+            torch.bitwise_right_shift(tmp0.t(), 1, out=tmp2)
+            torch.bitwise_or(tmp1, tmp2.t(), out=tmp1)
+            torch.bitwise_and(tmp1, 0b11_000000, out=tmp1)
+            torch.bitwise_and(tmp0, tmp1, out=tmp0)
+            torch.bitwise_or(tmp1, state, out=tmp1)
 
         if save_next_hop:
             def iterate():
-                torch.bitwise_and(state, 0b11_000000, out=tmp0)
-                torch.bitwise_left_shift(tmp0, 1, out=tmp1)
-                torch.bitwise_right_shift(tmp0, 1, out=tmp2[:tmp0.shape[1]].t())
-                torch.bitwise_or(tmp1, tmp2.t()[:, :tmp0.shape[1]], out=tmp1)
-                torch.bitwise_and(tmp1, 0b11_000000, out=tmp1)
-                torch.bitwise_and(tmp0, tmp1, out=tmp0)
-                torch.bitwise_or(tmp1, state, out=tmp1)
-
+                pre_update()
                 for j in range(state.size(1)):
                     torch.bitwise_and(link1, tmp0[:, j], out=tmp2)
                     torch.bitwise_and(link2, tmp1[:, j], out=tmp3)
                     torch.bitwise_or(tmp2, tmp3, out=tmp2)
-                    tmp2.sub_(link3)
 
                     max_vals, max_idx = torch.max(tmp2, dim=1)
-                    state[:, j] = max_vals
+                    state[:, j] = max_vals.sub_(1)
                     next_hop[:, j] = max_idx
+                # TODO (future): add batch processing for this iteration,
+                # and automatically estimate batch size by available memory
         else:
             def iterate():
-                torch.bitwise_and(state, 0b11_000000, out=tmp0)
-                torch.bitwise_left_shift(tmp0, 1, out=tmp1)
-                torch.bitwise_right_shift(tmp0, 1, out=tmp2[:tmp0.shape[1]].t())
-                torch.bitwise_or(tmp1, tmp2.t()[:, :tmp0.shape[1]], out=tmp1)
-                torch.bitwise_and(tmp1, 0b11_000000, out=tmp1)
-                torch.bitwise_and(tmp0, tmp1, out=tmp0)
-                torch.bitwise_or(tmp1, state, out=tmp1)
-
+                pre_update()
                 for j in range(state.size(1)):
                     torch.bitwise_and(link1, tmp0[:, j], out=tmp2)
                     torch.bitwise_and(link2, tmp1[:, j], out=tmp3)
                     torch.bitwise_or(tmp2, tmp3, out=tmp2)
-                    tmp2.sub_(link3)
-                    state[:, j] = torch.max(tmp2, dim=1)[0]
+                    state[:, j] = torch.max(tmp2, dim=1)[0].sub_(1)
 
         def runner():
-            prev_hash= torch.sum(state.to(torch.int64))
+            prev_hash = torch.sum(state, dtype=torch.int64)
             for it in range(max_iter):
                 iterate()
-                new_hash= torch.sum(state.to(torch.int64))
+                new_hash = torch.sum(state, dtype=torch.int64)
                 print(f"Iteration {it+1} completed")
                 if torch.equal(new_hash, prev_hash): # early stop
                     break
-                prev_hash_before = new_hash
+                prev_hash = new_hash
+            if next_hop is not None:
+                next_hop[state <= 0b00_111111] = -1
+                # TODO (future): write a custom CUDA kernel to reduce the mask tensor here
             return state.cpu().numpy(), next_hop.cpu().numpy() if next_hop is not None else None
         return runner()
 
