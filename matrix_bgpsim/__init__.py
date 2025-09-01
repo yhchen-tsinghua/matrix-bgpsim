@@ -1,54 +1,70 @@
+from __future__ import annotations
+from typing import (
+    Any, Iterator, Iterable, Union, Optional, Callable, Dict, List, Tuple, Set, NamedTuple
+)
+from pathlib import Path
+
 from multiprocessing import RawArray, Pool
 from ctypes import c_ubyte, c_int
-from collections.abc import Iterable, Set, Mapping, Callable, Sequence
 from collections import namedtuple, defaultdict
 import numpy as np
 import lz4.frame
 import pickle
-import os
 
 class RMatrix:
-    # AS relationship notations
-    # (adhere to CAIDA's norms)
-    P2C = -1 # provider-to-customer
-    P2P =  0 # peer-to-peer
-    C2P = +1 # customer-to-provider
+    # AS relationship notations (CAIDA norms)
+    P2C: int = -1 # provider-to-customer
+    P2P: int =  0 # peer-to-peer
+    C2P: int = +1 # customer-to-provider
 
-    # RelMap type definition
-    RelMap = namedtuple("RMatrix.RelMap", [
+    # Named tuple mapping AS relationship types:
+    # - P2P: Peer-to-peer (index 0)
+    # - C2P: Customer-to-provider (index +1)
+    # - P2C: Provider-to-customer (index -1)
+    RelMap: NamedTuple = namedtuple("RMatrix.RelMap", [
         "P2P", # accessed by either index  0 or .P2P
         "C2P", # accessed by either index +1 or .C2P
         "P2C", # accessed by either index -1 or .P2C
     ])
 
-    # BranchRoute type definition
-    BranchRoute = namedtuple("RMatrix.BranchRoute", [
+    # Named tuple representing how a branch AS can reach the root AS of the branch:
+    # - root (str): Root AS where the branch is connected
+    # - next_hop (str): Next-hop ASN towards the root
+    # - length (int): Number of hops to the root AS
+    # - branch_id (int): Unique identifier for the branch
+    BranchRoute: NamedTuple = namedtuple("RMatrix.BranchRoute", [
         "root",      # root AS where the branch is connected
         "next_hop",  # next-hop ASN to the root AS
         "length",    # number of hops to the root AS
         "branch_id", # to identify different branches
     ])
 
-    # shared matrix for multiprocessing in runtime
-    __shared_matrix__ = {
+    # Shared memory structures for multiprocessing:
+    # - state: Writable matrix, dtype uint8
+    # - next_hop (optional): Writable matrix, dtype int32
+    # - link1: Read-only matrix, dtype uint8
+    # - link2: Read-only matrix, dtype uint8
+    # - shape: shape tuple, (int, int)
+    __shared_matrix__: dict[str, Union[np.ndarray, tuple[int, int]]] = {
         # "state": writable, dtype uint8
         # "next_hop": (optional) writable, dtype int32
         # "link1": read-only, dtype uint8
         # "link2": read-only, dtype uint8
+        # "shape": shape tuple, (int, int)
     }
 
     # TODO (future): add lock for thread safety?
 
     @staticmethod
-    def caida_reader(fpath):
+    def caida_reader(fpath: Union[str, Path]) -> Iterator[Tuple[str, str, int]]:
         """
-        Parse a CAIDA-formatted AS relationship file.
+        Parse a CAIDA-formatted AS relationship file and yield tuples.
 
         Args:
-            fpath (str | Path): Path to the CAIDA relationship file.
+            fpath: Path to the CAIDA relationship file.
 
         Yields:
-            tuple[str, str, int]: (asn1, asn2, rel) for each AS pair.
+            Tuple[str, str, int]: asn1, asn2, and relationship type (RMatrix.P2C, P2P, C2P) for each AS pair.
         """
         with open(fpath, "r") as f:
             for line in f:
@@ -59,13 +75,23 @@ class RMatrix:
                 rel = int(rel)
                 yield asn1, asn2, rel
 
-    def __init__(self, input_rels, excluded=None):
+    def __init__(
+        self,
+        input_rels: Union[str, Path, Iterable[Tuple[str, str, int]]],
+        excluded: Optional[
+            Union[Callable[[str], bool], Iterable[str], Set[str], Dict[str, Any]]
+        ] = None
+    ) -> None:
         """
         Initialize the RMatrix object.
 
         Args:
-            input_rels (str | Path | Iterable): Either a path to a CAIDA file or an iterable of (asn1, asn2, rel) tuples.
-            excluded (None | container | Callable, optional): ASNs to exclude or a function for membership check.
+        input_rels: Path to a CAIDA file or iterable of (asn1, asn2, rel) tuples.
+        excluded: ASNs to exclude. Can be:
+            - None (no exclusion)
+            - Iterable[str] (list, tuple, set, etc.)
+            - Mapping[str, Any] (membership checked via `in`)
+            - Callable[[str], bool]: returns True if ASN should be excluded
         """
         (
             # core AS information
@@ -83,33 +109,41 @@ class RMatrix:
         self.__next_hop__ = None
 
     @staticmethod
-    def construct_topology(input_rels, excluded=None):
+    def construct_topology(
+        input_rels: Union[str, Path, Iterable[Tuple[str, str, int]]],
+        excluded: Optional[
+            Union[Callable[[str], bool], Iterable[str], Set[str], Dict[str, Any]]
+        ] = None
+    ) -> Tuple[
+        List[str],               # idx2asn: core AS index → ASN
+        Dict[str, int],          # asn2idx: ASN → core index
+        List[RMatrix.RelMap],    # idx2ngbrs: core AS neighbors
+        Dict[str, RMatrix.BranchRoute]  # asn2brts: branch ASN → branch route
+    ]:
         """
-        Build the AS-level topology.
-
-        Steps:
-            - Parse AS relationship data
-            - Identify and remove excluded ASNs
-            - Detect branches and dangling sub-trees
-            - Build core network adjacency lists
+        Build the AS-level topology, returning core/branch mappings.
 
         Args:
-            input_rels (str | Path | Iterable): Path to CAIDA file or iterable of AS relationships.
-            excluded (None | container | Callable): ASNs to exclude.
+            input_rels: Path to a CAIDA file or iterable of (asn1, asn2, rel) tuples.
+            excluded: ASNs to exclude. Can be:
+                - None (no exclusion)
+                - Iterable[str] (list, tuple, set, etc.)
+                - Mapping[str, Any] (membership checked via `in`)
+                - Callable[[str], bool]: returns True if ASN should be excluded
 
         Returns:
-            tuple: (idx2asn, asn2idx, idx2ngbrs, asn2brts)
-                idx2asn (list): Index-to-ASN mapping for core ASes
-                asn2idx (dict): ASN-to-index mapping for core ASes
-                idx2ngbrs (list[RelMap]): Core AS neighbors by relationship type
-                asn2brts (dict): Branch ASN → BranchRoute
+            tuple:
+                - idx2asn: List of core ASNs by index
+                - asn2idx: Dict from ASN to core index
+                - idx2ngbrs: Core AS neighbors as RelMap
+                - asn2brts: Dict from branch ASN to BranchRoute
         """
         # TODO (future): parallel simulation for disconnected sub-topologies
         # If the topology has several disconnected areas, assign each with a
         # single simluation task, so the matrix size can be greatly reduced.
 
         # construct AS relationships reader
-        if isinstance(input_rels, (str, bytes, os.PathLike)):
+        if isinstance(input_rels, (str, Path)):
             input_rels = RMatrix.caida_reader(input_rels)
         else:
             assert isinstance(input_rels, Iterable), \
@@ -118,10 +152,10 @@ class RMatrix:
         # construct membership checker for excluded ASes
         if excluded is None or excluded is False:
             excluded_check = lambda item: False
-        elif isinstance(excluded, (Set, Mapping)):
+        elif isinstance(excluded, (Set, Dict)):
             excluded_check = lambda item: item in excluded
-        elif isinstance(container, Sequence) and not isinstance(container, str):
-            excluded_check = lambda item: item in set(container)
+        elif isinstance(excluded, Iterable) and not isinstance(excluded, str):
+            excluded_check = lambda item: item in set(excluded)
         else:
             assert isinstance(excluded, Callable), \
                 f"excluded should be Callable or container for membership check: received {type(excluded)}"
@@ -218,44 +252,44 @@ class RMatrix:
 
         return idx2asn, asn2idx, idx2ngbrs, asn2brts
 
-    def asn2idx(self, asn):
+    def asn2idx(self, asn: str) -> int:
         """Return the index of a core ASN."""
         return self.__asn2idx__[asn]
 
-    def idx2asn(self, idx):
+    def idx2asn(self, idx: int) -> str:
         """Return the ASN corresponding to a given core AS index."""
         return self.__idx2asn__[idx]
 
-    def idx2ngbrs(self, idx):
-        """Return neighbors of a core AS (as RelMap)."""
+    def idx2ngbrs(self, idx: int) -> RMatrix.RelMap:
+        """Return neighbors of a core AS (as RMatrix.RelMap)."""
         return self.__idx2ngbrs__[idx]
 
-    def asn2brts(self, asn):
+    def asn2brts(self, asn: str) -> RMatrix.BranchRoute:
         """Return branch route details for a branch ASN."""
         return self.__asn2brts__[asn]
 
-    def is_core_asn(self, asn):
+    def is_core_asn(self, asn: str) -> bool:
         """Check if an ASN belongs to the core network."""
         return asn in self.__asn2idx__
 
-    def is_branch_asn(self, asn):
+    def is_branch_asn(self, asn: str) -> bool:
         """Check if an ASN belongs to a branch."""
         return asn in self.__asn2brts__
 
-    def has_asn(self, asn):
+    def has_asn(self, asn: str) -> bool:
         """Check if an ASN exists in the topology (core or branch)."""
         return self.is_core_asn(asn) or self.is_branch_asn(asn)
 
     @staticmethod
-    def __iterate_state_cpu__(worker_id, left, right, max_iter):
+    def __iterate_state_cpu__(worker_id: int, left: int, right: int, max_iter: int) -> None:
         """
         Worker process: Propagate routing states without next-hop info.
 
         Args:
-            worker_id (int): Worker identifier for logging.
-            left (int): Start column index for this worker.
-            right (int): End column index for this worker.
-            max_iter (int): Maximum number of iterations to run.
+            worker_id: Worker identifier for logging.
+            left: Start column index for this worker.
+            right: End column index for this worker.
+            max_iter: Maximum number of iterations to run.
         """
         shared = RMatrix.__shared_matrix__
 
@@ -299,15 +333,15 @@ class RMatrix:
                 break
 
     @staticmethod
-    def __iterate_state_and_next_hop_cpu__(worker_id, left, right, max_iter):
+    def __iterate_state_and_next_hop_cpu__(worker_id: int, left: int, right: int, max_iter: int) -> None:
         """
         Worker process: Propagate routing states and compute next-hop info.
 
         Args:
-            worker_id (int): Worker identifier for logging.
-            left (int): Start column index for this worker.
-            right (int): End column index for this worker.
-            max_iter (int): Maximum number of iterations to run.
+            worker_id: Worker identifier for logging.
+            left: Start column index for this worker.
+            right: End column index for this worker.
+            max_iter: Maximum number of iterations to run.
         """
         shared = RMatrix.__shared_matrix__
 
@@ -358,19 +392,26 @@ class RMatrix:
         # where no route is available, the next-hop is manually set to -1
         next_hop[:, left:right][state[:, left:right] <= 0b00_111111] = -1
 
-    def run(self, n_jobs=1, max_iter=32, save_next_hop=True, backend="cpu", device=None):
+    def run(
+        self,
+        n_jobs: int = 1,
+        max_iter: int = 32,
+        save_next_hop: bool = True,
+        backend: str = "cpu",
+        device: Optional[Union[str, int]] = None
+    ) -> None:
         """
         Run the routing simulation.
 
         Args:
-            n_jobs (int): Number of parallel processes (CPU only).
-            max_iter (int): Maximum number of iterations.
-            save_next_hop (bool): Whether to compute next-hop matrix.
-            backend (str): One of {"cpu", "torch", "cupy"}.
+            n_jobs: Number of parallel processes (CPU only).
+            max_iter: Maximum number of iterations.
+            save_next_hop: Whether to compute next-hop matrix.
+            backend: One of {"cpu", "torch", "cupy"}.
                 - "cpu": Default, uses NumPy + multiprocessing.
                 - "torch": GPU/CPU acceleration via PyTorch (requires `pip install matrix-bgpsim[torch]`).
                 - "cupy": GPU acceleration via CuPy (requires `pip install matrix-bgpsim[cupy]`).
-            device (str | None): Device specifier for GPU backends (e.g., "cuda:0", "cpu").
+            device: Device specifier for GPU backends (e.g., "cuda:0", "cpu").
                 Ignored for CPU backend. Defaults:
                 - torch: Uses "cuda:0" if available, else "cpu".
                 - cupy: Uses first available CUDA device.
@@ -397,21 +438,20 @@ class RMatrix:
             raise ValueError(f"Unsupported backend: {backend}")
 
         self.__state__, self.__next_hop__ = runner()
-        return self
 
     @staticmethod
-    def __cpu_runner__(idx2ngbrs, n_jobs, max_iter, save_next_hop):
+    def __cpu_runner__(idx2ngbrs: List[RMatrix.RelMap], n_jobs: int, max_iter: int, save_next_hop: bool) -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
         """
         Prepare shared memory and return a multiprocessing runner function.
 
         Args:
-            idx2ngbrs (list[RelMap]): Core AS neighbors.
-            n_jobs (int): Number of parallel processes.
-            max_iter (int): Maximum iterations for state propagation.
-            save_next_hop (bool): Whether to compute next-hop info.
+            idx2ngbrs: Core AS neighbors.
+            n_jobs: Number of parallel processes.
+            max_iter: Maximum iterations for state propagation.
+            save_next_hop: Whether to compute next-hop info.
 
         Returns:
-            Callable: A runner function that launches the simulation.
+            A runner function that launches the simulation.
         """
         # init matrix
         size = len(idx2ngbrs)
@@ -486,18 +526,18 @@ class RMatrix:
         return runner
 
     @staticmethod
-    def __torch_runner__(idx2ngbrs, max_iter, save_next_hop, device="cuda:0"):
+    def __torch_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: str = "cuda:0") -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
         """
         Prepare a runner for simulation on PyTorch backend.
 
         Args:
-            idx2ngbrs (list[RelMap]): Core AS neighbors.
-            max_iter (int): Maximum iterations.
-            save_next_hop (bool): Whether to compute next-hop info.
-            device (str): PyTorch device (e.g., "cuda:0", "cpu").
+            idx2ngbrs: Core AS neighbors.
+            max_iter: Maximum iterations.
+            save_next_hop: Whether to compute next-hop info.
+            device: PyTorch device (e.g., "cuda:0", "cpu").
 
         Returns:
-            Callable: A runner function that performs the simulation.
+            A runner function that performs the simulation.
         """
         device = torch.device(device)
 
@@ -579,18 +619,18 @@ class RMatrix:
         return runner()
 
     @staticmethod
-    def __cupy_runner__(idx2ngbrs, max_iter, save_next_hop, device=0):
+    def __cupy_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: int = 0) -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
         """
         Prepare and execute simulation on CuPy backend.
 
         Args:
-            idx2ngbrs (list[RelMap]): Core AS neighbors.
-            max_iter (int): Maximum iterations.
-            save_next_hop (bool): Whether to compute next-hop info.
-            device (int): CuPy device ID (e.g., 0 for "cuda:0").
+            idx2ngbrs: Core AS neighbors.
+            max_iter: Maximum iterations.
+            save_next_hop: Whether to compute next-hop info.
+            device: CuPy device ID (e.g., 0 for "cuda:0").
 
         Returns:
-            Callable: A runner function that performs the simulation.
+            A runner function that performs the simulation.
         """
         with cp.cuda.Device(device):
             size = len(idx2ngbrs)
@@ -662,13 +702,9 @@ class RMatrix:
 
             return runner()
 
-    def get_state(self, asn1, asn2):
+    def get_state(self, asn1: str, asn2: str) -> Tuple[Optional[int], int]:
         """
-        Get the routing relationship and path length between two ASNs.
-
-        This method returns a tuple indicating the route relationship
-        (C2P, P2P, P2C) and the path length from `asn1` to `asn2`. It uses
-        the state matrix computed during the last simulation run.
+        Get the route priority and path length between two ASNs.
 
         **Important caveats:**
             - Simulation (`run()`) must have been executed before calling this method,
@@ -677,14 +713,13 @@ class RMatrix:
             - If `asn1 == asn2`, the type defaults to `P2C` and length is 0.
 
         Args:
-            asn1 (str): Source ASN.
-            asn2 (str): Destination ASN.
+            asn1: Source ASN.
+            asn2: Destination ASN.
 
         Returns:
-            tuple[int | None, int]:
-                - s_type: One of {None, RMatrix.C2P, RMatrix.P2P, RMatrix.P2C}
-                  or None if no route exists.
-                - s_len: Path length if s_type is not None, otherwise undefined (returns 0 here).
+            tuple:
+                - s_type: Relationship type (P2C, P2P, C2P) or None if unreachable.
+                - s_len: Path length (0 if unreachable or same ASN).
         """
         assert self.has_asn(asn1), f"{asn1} is not in the topology"
         assert self.has_asn(asn2), f"{asn2} is not in the topology"
@@ -742,12 +777,9 @@ class RMatrix:
 
         return s_type, s_len
 
-    def get_path(self, asn1, asn2):
+    def get_path(self, asn1: str, asn2: str) -> Optional[List[str]]:
         """
-        Get the AS-level path (sequence of ASNs) from `asn1` to `asn2`.
-
-        This method returns the explicit AS path derived from the simulation.
-        It uses the next-hop matrix computed during the last simulation run.
+        Retrieve the AS-level path from `asn1` to `asn2`.
 
         **Important caveats:**
             - Simulation (`run(save_next_hop=True)`) must have been executed before
@@ -756,15 +788,14 @@ class RMatrix:
             - If `asn1 == asn2`, returns an empty list `[]` because no hops are needed.
 
         Args:
-            asn1 (str): Source ASN.
-            asn2 (str): Destination ASN.
+            asn1 : Source ASN.
+            asn2 : Destination ASN.
 
         Returns:
-            list[str] | None:
-                - A list of ASNs forming the path from `asn1` to `asn2`
-                  (excluding `asn1`, including `asn2`).
-                - `[]` if `asn1 == asn2`.
-                - `None` if no path exists.
+            - A list of ASNs forming the path from `asn1` to `asn2`
+              (excluding `asn1`, including `asn2`).
+            - `[]` if `asn1 == asn2`.
+            - `None` if no path exists.
         """
         assert self.has_asn(asn1), f"{asn1} is not in the topology"
         assert self.has_asn(asn2), f"{asn2} is not in the topology"
@@ -843,11 +874,11 @@ class RMatrix:
 
         return path
 
-    def dump(self, fpath):
+    def dump(self, fpath: Union[str, Path]) -> None:
         """Serialize and save the current RMatrix object to a lz4 file."""
         pickle.dump(self, lz4.frame.open(fpath, "wb"), protocol=4)
 
     @staticmethod
-    def load(fpath):
+    def load(fpath: Union[str, Path]) -> RMatrix:
         """Load an RMatrix object from a serialized lz4 file."""
         return pickle.load(lz4.frame.open(fpath, "rb"))
