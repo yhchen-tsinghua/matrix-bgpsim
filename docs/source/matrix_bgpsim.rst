@@ -1,8 +1,5 @@
-matrix\_bgpsim package
+matrix\_bgpsim
 ======================
-
-Module contents
----------------
 
 .. automodule:: matrix_bgpsim
    :members:
