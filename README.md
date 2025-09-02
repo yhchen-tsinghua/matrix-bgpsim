@@ -7,7 +7,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellowgreen.svg?maxAge=2592000" alt="License"></a>
 </p>
 
-`matrix-bgpsim` is a Python package that provides a high-performance BGP routing simulator built on matrix operations. It enables full-scale AS-level route generation across the entire global Internet topology (77k+ ASes) in just a few hours, following the Gao-Rexford simulation model. It supports CPU backend with Python-native multiprocessing, and optionally GPU acceleration via PyTorch and CuPy backends.
+`matrix-bgpsim` is a Python project that provides a high-performance BGP routing simulator built on matrix operations. It enables full-scale AS-level route generation across the entire global Internet topology (77k+ ASes) in just a few hours, following the Gao-Rexford simulation model. It supports CPU backend with Python-native multiprocessing, and optionally GPU acceleration via PyTorch and CuPy backends.
 
 &#9989; Use `matrix-bgpsim` when you need large-scale simulation to compute all-pairs AS-level routes.
 

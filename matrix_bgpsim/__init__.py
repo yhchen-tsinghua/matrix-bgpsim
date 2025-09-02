@@ -21,7 +21,7 @@ class RMatrix:
     # - P2P: Peer-to-peer (index 0)
     # - C2P: Customer-to-provider (index +1)
     # - P2C: Provider-to-customer (index -1)
-    RelMap: NamedTuple = namedtuple("RMatrix.RelMap", [
+    RelMap: NamedTuple = namedtuple("RelMap", [
         "P2P", # accessed by either index  0 or .P2P
         "C2P", # accessed by either index +1 or .C2P
         "P2C", # accessed by either index -1 or .P2C
@@ -32,7 +32,7 @@ class RMatrix:
     # - next_hop (str): Next-hop ASN towards the root
     # - length (int): Number of hops to the root AS
     # - branch_id (int): Unique identifier for the branch
-    BranchRoute: NamedTuple = namedtuple("RMatrix.BranchRoute", [
+    BranchRoute: NamedTuple = namedtuple("BranchRoute", [
         "root",      # root AS where the branch is connected
         "next_hop",  # next-hop ASN to the root AS
         "length",    # number of hops to the root AS
@@ -86,12 +86,12 @@ class RMatrix:
         Initialize the RMatrix object.
 
         Args:
-        input_rels: Path to a CAIDA file or iterable of (asn1, asn2, rel) tuples.
-        excluded: ASNs to exclude. Can be:
-            - None (no exclusion)
-            - Iterable[str] (list, tuple, set, etc.)
-            - Mapping[str, Any] (membership checked via `in`)
-            - Callable[[str], bool]: returns True if ASN should be excluded
+            input_rels: Path to a CAIDA file or iterable of (asn1, asn2, rel) tuples.
+            excluded: ASNs to exclude. Can be:
+                - None (no exclusion)
+                - Iterable[str] (list, tuple, set, etc.)
+                - Mapping[str, Any] (membership checked via `in`)
+                - Callable[[str], bool]: returns True if ASN should be excluded
         """
         (
             # core AS information
@@ -135,8 +135,8 @@ class RMatrix:
             tuple:
                 - idx2asn: List of core ASNs by index
                 - asn2idx: Dict from ASN to core index
-                - idx2ngbrs: Core AS neighbors as RelMap
-                - asn2brts: Dict from branch ASN to BranchRoute
+                - idx2ngbrs: Core AS neighbors as RMatrix.RelMap
+                - asn2brts: Dict from branch ASN to RMatrix.BranchRoute
         """
         # TODO (future): parallel simulation for disconnected sub-topologies
         # If the topology has several disconnected areas, assign each with a
@@ -440,7 +440,7 @@ class RMatrix:
         self.__state__, self.__next_hop__ = runner()
 
     @staticmethod
-    def __cpu_runner__(idx2ngbrs: List[RMatrix.RelMap], n_jobs: int, max_iter: int, save_next_hop: bool) -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
+    def __cpu_runner__(idx2ngbrs: List[RMatrix.RelMap], n_jobs: int, max_iter: int, save_next_hop: bool) -> Callable[[], Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
         """
         Prepare shared memory and return a multiprocessing runner function.
 
@@ -526,7 +526,7 @@ class RMatrix:
         return runner
 
     @staticmethod
-    def __torch_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: str = "cuda:0") -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
+    def __torch_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: str = "cuda:0") -> Callable[[], Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
         """
         Prepare a runner for simulation on PyTorch backend.
 
@@ -619,7 +619,7 @@ class RMatrix:
         return runner()
 
     @staticmethod
-    def __cupy_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: int = 0) -> Callable[[], Tuple[Optional[np.ndarray], Optional[]]]:
+    def __cupy_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: int = 0) -> Callable[[], Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
         """
         Prepare and execute simulation on CuPy backend.
 
