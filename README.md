@@ -207,11 +207,84 @@ rmatrix = RMatrix.load("rmatrix.lz4")
 
 ### Simulation Criteria
 
+`matrix-bgpsim` follows the standard Gao-Rexford simulation principles for AS-level routing. Route selection proceeds in three steps:: 
+
+* Highest local preference: routes from customers are preferred over peers, which in turn are preferred over providers.
+* Shortest AS path: among routes with equal local preference, the path with fewer AS hops is chosen.
+* Random tie-breaking: if multiple routes remain equivalent, the one with smallest ASN is selected (looks random).
+
+The valley-free constraint is also enforced: routes learned from a peer or provider are only propagated to customers, preventing "valley" paths in the network.
+
 ### Topology Compression
+
+To improve simulation efficiency, `matrix-bgpsim` compresses the Internet topology by separating _core ASes_ from _branch ASes_.
+
+* Core ASes are the main nodes in the network that participate directly in the matrix-based BGP route inference. These typically include ASes with multiple providers, multiple customers, or any peers.
+
+* Branch ASes are typically single-homed ASes or stub networks whose routing tables can be fully derived from their upstream access AS. A branch is defined recursively as a sequence of ASes starting from a stub AS and following its single provider until reaching a core AS (the access AS) with either:
+    -   more than one provider,
+    -   more than one customer, or
+    -   any peers.
+
+The key intuition is that all routes to or from branch ASes pass through their access AS (called "root" in the code). Therefore, branch ASes do not need to participate in the main matrix simulation. Instead:
+
+1. The core topology is extracted by pruning all branch ASes.
+2. BGP routing simulation is performed only on the core topology.
+3. outes for branch ASes are efficiently reconstructed afterwards using their access AS’s routing table, e.g., by concatenating the branch sequence.
+
+This approach significantly reduces simulation complexity while preserving complete routing information. In practice, it can reduce topology size by over 30% in vertices, leaving only the core ASes for matrix-based computation.
 
 ### One-Byte Encoding
 
+Route selection in BGP can be computationally expensive. `matrix-bgpsim` speeds this up using a one-byte route priority encoding, which packs both local preference and path length into a single byte.
+
+* Structure of the byte:
+    - The two most significant bits encode local preference:
+        - `11`: customer route
+        - `10`: peer route
+        - `01`: provider route
+        - `00`: unreachable origin
+    - The six least significant bits store the bitwise complement of the path length (max 63 hops).
+
+* Why design so:
+    - Higher byte values indicate more preferred routes.
+    - Best-route selection becomes a simple max operation over the byte array.
+    - Updating the route during propagation only requires basic arithmetic, e.g., subtracting one per hop to adjust the path length field.
+
+This encoding allows `matrix-bgpsim` to turn complex BGP iterations into highly optimized matrix operations, making large-scale AS-level simulations fast and memory-efficient.
+
 ### Matrix Operations
+
+`matrix-bgpsim` represents the network as matrices, allowing route propagation and next-hop computation to be performed in a fully vectorized way.
+
+* State matrix: Each element encodes the route priority (local preference + path length) from a source AS to a destination AS using the one-byte encoding.
+
+* Next-hop matrix: Stores the index of the first AS to forward a route toward a destination. It is updated simultaneously with the state matrix.
+
+* Initialization:
+    - The diagonal of the state matrix is set to enforce self-reachability.
+    - Neighbor relationships (C2P, P2P, P2C) are initialized with appropriate priorities in the state matrix.
+    - Link matrices (link1 and link2) help track propagation directions.
+
+* Propagation loop:
+    1. Prepare state updates: Bitwise operations separate the local preference and path length fields and combine them for propagation.
+    2. Compute new priorities: For each destination, the algorithm evaluates all incoming routes via neighbors and selects the maximum priority route.
+    3. Update next-hop matrix: The index corresponding to the chosen route becomes the next hop for that destination.
+    4. Repeat: Iteration continues until the routing state converges. 
+
+* Path reconstruction:
+
+    Once the next-hop matrix is computed:
+
+    1. Start from a source AS and repeatedly look up the next-hop AS for the desired destination.
+    2. Follow the chain of next hops recursively until the destination is reached.
+    3. This reconstructs the full AS-level path without needing to store all intermediate route information during propagation.
+
+* Advantages:
+
+    - Fully vectorized using PyTorch (or CuPy/NumPy for other backends).
+    - Efficient next-hop tracking allows fast path reconstruction on demand.
+    - Matrix operations reduce BGP propagation to bitwise and arithmetic operations, maximizing speed and memory efficiency.
 
 ## Contact
 

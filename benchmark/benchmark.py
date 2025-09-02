@@ -19,7 +19,7 @@ for line in open(script_dir/"md5-checksum.txt", "r"):
     checksums[filename] = checksum
 
 # benchmark and correctness check
-for as_rels in ["core-10000.20250101.as-rel2.txt", "random-10000.20250101.as-rel2.txt"]:
+for as_rels in ["random-10000.20250101.as-rel2.txt", "core-10000.20250101.as-rel2.txt"]:
     as_rels = script_dir/as_rels
 
     # ensure test file integrity

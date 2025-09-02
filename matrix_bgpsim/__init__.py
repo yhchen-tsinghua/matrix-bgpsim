@@ -175,6 +175,7 @@ class RMatrix:
         # find all branches
         asn2brts = dict() # branch AS -> branch route
         branch_id = 0
+        to_prune = []
         for asn, (peers, providers, customers) in asn2ngbrs.items(): # see RelMap definition
             # search from stub AS
             if len(customers) != 0 or len(peers) != 0 or len(providers) != 1:
@@ -194,7 +195,7 @@ class RMatrix:
                 asn, = providers 
                 peers, providers, customers = asn2ngbrs[asn]
 
-            asn2ngbrs[asn].P2C.remove(branch[-1]) # prune the branch from the root AS
+            to_prune.append((asn, branch[-1])) # where the branch should be pruned
 
             for i, branch_as in enumerate(branch[::-1]):
                 upstream = branch[-i] if i > 0 else asn
@@ -205,6 +206,9 @@ class RMatrix:
             # along the branch, and after {length} hops, it can finally reach a root
             # AS, which can be either a core AS or the root of a dangling sub-tree.
             branch_id += 1
+
+        for asn1, asn2 in to_prune: # prune all branches from their root ASes
+            asn2ngbrs[asn1].P2C.remove(asn2) 
 
         # An AS could be dangling (disconnected from the core network)
         # either by default or due to the previous branch pruning
