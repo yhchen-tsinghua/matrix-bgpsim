@@ -54,4 +54,4 @@ for as_rels in ["random-10000.20250101.as-rel2.txt", "core-10000.20250101.as-rel
             assert (rmatrices[i].__state__ == rmatrices[j].__state__).all()
             assert (rmatrices[i].__next_hop__ == rmatrices[j].__next_hop__).all()
 
-json.dump(results, script_dir/"results.json", indent=2)
+json.dump(results, open(script_dir/"results.json", "r"), indent=2)
