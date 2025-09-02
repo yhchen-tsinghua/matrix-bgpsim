@@ -6,7 +6,7 @@ from pathlib import Path
 
 from multiprocessing import RawArray, Pool
 from ctypes import c_ubyte, c_int
-from collections import namedtuple, defaultdict
+from collections import defaultdict
 import numpy as np
 import lz4.frame
 import pickle
@@ -21,23 +21,21 @@ class RMatrix:
     # - P2P: Peer-to-peer (index 0)
     # - C2P: Customer-to-provider (index +1)
     # - P2C: Provider-to-customer (index -1)
-    RelMap: NamedTuple = namedtuple("RelMap", [
-        "P2P", # accessed by either index  0 or .P2P
-        "C2P", # accessed by either index +1 or .C2P
-        "P2C", # accessed by either index -1 or .P2C
-    ])
+    class RelMap(NamedTuple):
+        P2P: int # accessed by either index  0 or .P2P
+        C2P: int # accessed by either index +1 or .C2P
+        P2C: int # accessed by either index -1 or .P2C
 
     # Named tuple representing how a branch AS can reach the root AS of the branch:
     # - root (str): Root AS where the branch is connected
     # - next_hop (str): Next-hop ASN towards the root
     # - length (int): Number of hops to the root AS
     # - branch_id (int): Unique identifier for the branch
-    BranchRoute: NamedTuple = namedtuple("BranchRoute", [
-        "root",      # root AS where the branch is connected
-        "next_hop",  # next-hop ASN to the root AS
-        "length",    # number of hops to the root AS
-        "branch_id", # to identify different branches
-    ])
+    class BranchRoute(NamedTuple):
+        root: str      # root AS where the branch is connected
+        next_hop: str  # next-hop ASN to the root AS
+        length: int    # number of hops to the root AS
+        branch_id: int # to identify different branches
 
     # Shared memory structures for multiprocessing:
     # - state: Writable matrix, dtype uint8
@@ -107,6 +105,8 @@ class RMatrix:
         # matrix for simulation (init on runtime)
         self.__state__ = None
         self.__next_hop__ = None
+
+        # TODO (future): estimate memory peak
 
     @staticmethod
     def construct_topology(
@@ -244,7 +244,6 @@ class RMatrix:
         num_nodes = num_core_nodes + len(asn2brts)
         num_edges = len(edges)
         print(f"Topology constructed")
-        print(f"load: {input_rels}")
         print(f"nodes: {num_nodes:,}")
         print(f"core nodes: {num_core_nodes:,} ({num_core_nodes/num_nodes:.2%})")
         print(f"edges: {num_edges:,}")
@@ -461,9 +460,9 @@ class RMatrix:
         state_np = np.frombuffer(state, dtype=np.uint8).reshape(shape, order="F") # numpy interface
         state_np[:] = 0b00_111111
         for i, ngbrs in enumerate(idx2ngbrs):
-            state_np[ngbrs.C2P, i] = 0b11_111110 # one-hop route to providers
-            state_np[ngbrs.P2P, i] = 0b10_111110 # one-hop route to peers
-            state_np[ngbrs.P2C, i] = 0b01_111110 # one-hop route to customers
+            state_np[ngbrs.C2P, i] = 0b11_111110 # one-hop route to customeer i
+            state_np[ngbrs.P2P, i] = 0b10_111110 # one-hop route to peer i
+            state_np[ngbrs.P2C, i] = 0b01_111110 # one-hop route to provider i
         state_np[np.arange(size), np.arange(size)] = 0b11_111111 # self-pointing route
         print(f"state matrix constructed")
 
@@ -488,6 +487,7 @@ class RMatrix:
             next_hop_np = np.frombuffer(next_hop, dtype=np.int32).reshape(shape, order="F")
             next_hop_np[:] = -1
             print(f"next_hop matrix constructed")
+        else: next_hop_np = None
 
         # split for parallel tasks
         assert n_jobs >= 1
@@ -515,13 +515,10 @@ class RMatrix:
         params = zip(range(n_jobs), split[:-1], split[1:], [max_iter]*n_jobs)
 
         def runner():
-            try:
-                with Pool(processes=n_jobs, initializer=initializer, initargs=initargs) as pool:
-                    pool.starmap(process_call, params)
-                return (RMatrix.__shared_matrix__.pop("state", None),
-                        RMatrix.__shared_matrix__.pop("next_hop", None))
-            finally:
-                RMatrix.__shared_matrix__ = {}
+            with Pool(processes=n_jobs, initializer=initializer, initargs=initargs) as pool:
+                pool.starmap(process_call, params)
+                RMatrix.__shared_matrix__.clear()
+            return state_np, next_hop_np
 
         return runner
 
@@ -540,6 +537,7 @@ class RMatrix:
             A runner function that performs the simulation.
         """
         device = torch.device(device)
+        print(f"runner with {device}")
 
         # pre-allocate all matrices with proper memory layout
         size = len(idx2ngbrs)
@@ -560,6 +558,7 @@ class RMatrix:
 
         # initialize state and link matrices
         with torch.no_grad():
+            state.fill_diagonal_(0b11_111111)
             for i, ngbrs in enumerate(idx2ngbrs):
                 state[ngbrs.C2P, i] = 0b11_111110
                 state[ngbrs.P2P, i] = 0b10_111110
@@ -614,6 +613,7 @@ class RMatrix:
                 if next_hop is not None:
                     next_hop[state <= 0b00_111111] = -1
                 # TODO (future): write a custom CUDA kernel to reduce the mask tensor here
+                # TODO (future): fine-grained early stop mechanism
             return state.cpu().numpy(), next_hop.cpu().numpy() if next_hop is not None else None
 
         return runner()
@@ -633,6 +633,7 @@ class RMatrix:
             A runner function that performs the simulation.
         """
         with cp.cuda.Device(device):
+            print(f"runner with device {device}")
             size = len(idx2ngbrs)
             shape = (size, size)
 
@@ -649,6 +650,7 @@ class RMatrix:
             next_hop = cp.full(shape, -1, dtype=cp.int32).T if save_next_hop else None
 
             # initialize state and link matrices
+            cp.fill_diagonal(state, 0b11_111111)
             for i, ngbrs in enumerate(idx2ngbrs):
                 state[ngbrs.C2P, i] = 0b11_111110
                 state[ngbrs.P2P, i] = 0b10_111110
