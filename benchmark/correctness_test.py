@@ -151,19 +151,30 @@ def check_correctness(as_rels, rmatrix, n_sample=100):
                 rel = P2C if rel is None else -rel # first-hop rel; None if asn1 == asn2
                 length = len(path)
             else:
+                path = None
                 rel = None
 
             _rel, _length = rmatrix.get_state(asn1, asn2)
             _path = rmatrix.get_path(asn1, asn2)
 
             # state & path check
-            assert _rel == rel
-            if rel is not None:
-                assert length == _length
-                assert _length == len(_path)
-                assert _path is not None
-                assert _path == path
-            else:
-                assert _path is None
+            try:
+                assert _rel == rel
+                if rel is not None:
+                    assert length == _length
+                    assert _length == len(_path)
+                    assert _path is not None
+                    assert _path == path
+                else:
+                    assert _path is None
+            except AssertionError:
+                print(
+                    f"{asn1} -> {asn2} failed\n"\
+                    f"  rel: {rel}\n"\
+                    f" _rel: {_rel}\n"\
+                    f" path: {path}\n"\
+                    f"_path: {_path}"
+                )
+                raise
 
     print("Results correct.")

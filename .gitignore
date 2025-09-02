@@ -5,3 +5,4 @@ docs/build
 benchmark/*.txt
 !benchmark/md5-checksum.txt
 benchmark/*.lz4
+*.egg-info/

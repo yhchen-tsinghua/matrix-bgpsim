@@ -176,13 +176,12 @@ class RMatrix:
         asn2brts = dict() # branch AS -> branch route
         branch_id = 0
         for asn, (peers, providers, customers) in asn2ngbrs.items(): # see RelMap definition
-            # search from stub/dangling AS
-            if len(customers) != 0 or len(peers) != 0 or len(providers) > 1:
+            # search from stub AS
+            if len(customers) != 0 or len(peers) != 0 or len(providers) != 1:
                 continue 
 
-            # TODO (future): optimization for stub-peering ASes
-            # (i.e., those with no customer/provider but 1 peer)
-            # Routing tables of stub-peering ASes can be directly derived from their peers,
+            # TODO (future): optimization for ASes with only one customer/peer as its neighbor
+            # Routing tables of these ASes can be directly derived from their only neighbors,
             # so they can be excluded from the core network too for simulation efficiency.
 
             branch = []
@@ -195,14 +194,7 @@ class RMatrix:
                 asn, = providers 
                 peers, providers, customers = asn2ngbrs[asn]
 
-            # if this whole sub-tree is dangling (disconnected from the core network)
-            if len(providers) == 0 and len(peers) == 0: 
-                # it might still have multiple customers, thus forming a sub-tree,
-                # and asn is the root (it could also be a single dangling AS).
-                # Add a self-pointing branch route for it so it will not be included
-                # in the core network later, which improves simulation efficiency.
-                asn2brts[asn] = RMatrix.BranchRoute(
-                        root=asn, next_hop=None, length=0, branch_id=None)
+            asn2ngbrs[asn].P2C.remove(branch[-1]) # prune the branch from the root AS
 
             for i, branch_as in enumerate(branch[::-1]):
                 upstream = branch[-i] if i > 0 else asn
@@ -213,6 +205,16 @@ class RMatrix:
             # along the branch, and after {length} hops, it can finally reach a root
             # AS, which can be either a core AS or the root of a dangling sub-tree.
             branch_id += 1
+
+        # An AS could be dangling (disconnected from the core network)
+        # either by default or due to the previous branch pruning
+        for asn, (peers, providers, customers) in asn2ngbrs.items():
+            if not peers and not providers and not customers:
+                # Add a self-pointing branch route for it so it will not be included
+                # in the core network later, which improves simulation efficiency.
+                assert asn not in asn2brts
+                asn2brts[asn] = RMatrix.BranchRoute(
+                        root=asn, next_hop=None, length=0, branch_id=None)
 
         # construct core networks
         idx2asn = list()
@@ -536,6 +538,8 @@ class RMatrix:
         Returns:
             A runner function that performs the simulation.
         """
+        # TODO (future): auto-chunking when GPU memeory is limited
+        # TODO (future): multiple-GPU support
         device = torch.device(device)
         print(f"runner with {device}")
 
@@ -589,6 +593,7 @@ class RMatrix:
                     max_vals, max_idx = torch.max(tmp2, dim=1)
                     state[:, j] = max_vals.sub_(1)
                     next_hop[:, j] = max_idx
+                state.fill_diagonal_(0b11_111111)
                 # TODO (future): add batch processing for this iteration,
                 # and automatically estimate batch size by available memory
         else:
@@ -599,6 +604,7 @@ class RMatrix:
                     torch.bitwise_and(link2, tmp1[:, j], out=tmp3)
                     torch.bitwise_or(tmp2, tmp3, out=tmp2)
                     state[:, j] = torch.max(tmp2, dim=1)[0].sub_(1)
+                state.fill_diagonal_(0b11_111111)
 
         def runner():
             with torch.no_grad():
@@ -616,7 +622,7 @@ class RMatrix:
                 # TODO (future): fine-grained early stop mechanism
             return state.cpu().numpy(), next_hop.cpu().numpy() if next_hop is not None else None
 
-        return runner()
+        return runner
 
     @staticmethod
     def __cupy_runner__(idx2ngbrs: List[RMatrix.RelMap], max_iter: int, save_next_hop: bool, device: int = 0) -> Callable[[], Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
@@ -680,6 +686,7 @@ class RMatrix:
 
                         state[:, j] = cp.max(tmp2, axis=1) - 1
                         next_hop[:, j] = cp.argmax(tmp2, axis=1)
+                    cp.fill_diagonal(state, 0b11_111111)
             else:
                 def iterate():
                     pre_update()
@@ -688,6 +695,7 @@ class RMatrix:
                         cp.bitwise_and(link2, tmp1[:, j], out=tmp3)
                         cp.bitwise_or(tmp2, tmp3, out=tmp2)
                         state[:, j] = cp.max(tmp2, axis=1) - 1
+                    cp.fill_diagonal(state, 0b11_111111)
 
             def runner():
                 prev_hash = cp.sum(state, dtype=cp.int64)
@@ -702,7 +710,7 @@ class RMatrix:
                     next_hop[state <= 0b00_111111] = -1
                 return state.get(), next_hop.get() if next_hop is not None else None
 
-            return runner()
+            return runner
 
     def get_state(self, asn1: str, asn2: str) -> Tuple[Optional[int], int]:
         """
