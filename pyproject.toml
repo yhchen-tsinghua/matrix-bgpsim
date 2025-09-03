@@ -1,11 +1,26 @@
 [project]
 name = "matrix-bgpsim"
-version = "0.1.0"
+version = "1.0.1"
 description = "Matrix-based BGP simulation tool for AS-level routing analysis, supporting GPU acceleration."
 authors = [{ name = "Yihao Chen", email = "yh-chen21@mails.tsinghua.edu.cn" }]
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
+keywords = ["bgp", "simulation", "networking", "as-level", "gpu"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+
 dependencies = [
     "lz4",
     "numpy>=1.21"
@@ -19,10 +34,10 @@ cupy = ["cupy>=12.0.0"]
 Homepage = "https://github.com/yhchen-tsinghua/matrix-bgpsim"
 Repository = "https://github.com/yhchen-tsinghua/matrix-bgpsim"
 Issues = "https://github.com/yhchen-tsinghua/matrix-bgpsim/issues"
-Documentation = "https://github.com/yhchen-tsinghua/matrix-bgpsim/wiki"
+Documentation = "https://matrix-bgpsim.readthedocs.io/en/latest/"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

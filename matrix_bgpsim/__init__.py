@@ -11,6 +11,14 @@ import numpy as np
 import lz4.frame
 import pickle
 
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("matrix-bgpsim")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
+
 class RMatrix:
     # AS relationship notations (CAIDA norms)
     P2C: int = -1 # provider-to-customer
