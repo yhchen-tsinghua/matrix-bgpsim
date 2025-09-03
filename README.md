@@ -5,6 +5,8 @@
   <a href="https://pypi.org/project/matrix-bgpsim/"><img src="https://img.shields.io/pypi/v/matrix-bgpsim.svg?maxAge=600" alt="PyPI version"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.8%2B-brightgreen.svg?maxAge=2592000" alt="Python version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellowgreen.svg?maxAge=2592000" alt="License"></a>
+  <a href="https://matrix-bgpsim.readthedocs.io/en/latest/"><img src="https://readthedocs.org/projects/matrix-bgpsim/badge/?version=latest" alt="Docs Status" />
+</a>
 </p>
 
 `matrix-bgpsim` is a Python project that provides a high-performance BGP routing simulator built on matrix operations. It enables full-scale AS-level route generation across the entire global Internet topology (77k+ ASes) in just a few hours, following the Gao-Rexford simulation model. It supports CPU backend with Python-native multiprocessing, and optionally GPU acceleration via PyTorch and CuPy backends.
@@ -25,6 +27,7 @@
     -   [Simulation](#2-simulation)
     -   [Query](#3-query)
     -   [Save and Load](#4-save-and-load)
+-   [Documentation](#documentation)
 -   [How It Works](#how-it-works)
     -   [Simulation Criteria](#simulation-criteria)
     -   [Topology Compression](#topology-compression)
@@ -202,6 +205,10 @@ To load the computed results from disk:
 ```python
 rmatrix = RMatrix.load("rmatrix.lz4")
 ```
+
+## Documentation
+
+The full API reference and usage guide are available at 👉 https://matrix-bgpsim.readthedocs.io
 
 ## How It Works
 
