@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellowgreen.svg?maxAge=2592000" alt="License"></a>
 </p>
 
-`matrix-bgpsim` is a Python project that provides a high-performance BGP routing simulator built on matrix operations. It enables full-scale AS-level route generation across the entire global Internet topology (77k+ ASes) in just a few hours, following the Gao-Rexford simulation model. It supports CPU backend with Python-native multiprocessing, and optionally GPU acceleration via PyTorch and CuPy backends.
+`matrix-bgpsim` is a Python project that provides a high-performance BGP routing simulator built on matrix operations. It enables full-scale AS-level route generation across the entire global Internet topology (77k+ ASes) in just a few hours, following the Gao-Rexford simulation model. It supports CPU backend with Python-native multiprocessing, and optionally GPU acceleration via PyTorch or CuPy backends.
 
 &#9989; Use `matrix-bgpsim` when you need large-scale simulation to compute all-pairs AS-level routes.
 
@@ -179,7 +179,7 @@ To query the priority (i.e., whether it is from customer, peer, or provider) and
 
 ```python
 # Query the priority and path length of the route from AS7018 to AS3356
-# priority: [1|0|-1|None] for [customer|peer|provider|unavailable] route
+# priority: [1|0|-1|None] for [provider|peer|customer|unavailable] route
 # length: the number of AS hops
 priority, length = rmatrix.get_state("7018", "3356")
 ```
@@ -213,7 +213,7 @@ The full API reference and usage guide are available at 👉 https://matrix-bgps
 
 ### Simulation Criteria
 
-`matrix-bgpsim` follows the standard Gao-Rexford simulation principles for AS-level routing. Route selection proceeds in three steps:: 
+`matrix-bgpsim` follows the standard Gao-Rexford simulation principles for AS-level routing. Route selection proceeds in three steps:
 
 * Highest local preference: routes from customers are preferred over peers, which in turn are preferred over providers.
 * Shortest AS path: among routes with equal local preference, the path with fewer AS hops is chosen.
@@ -225,7 +225,7 @@ The valley-free constraint is also enforced: routes learned from a peer or provi
 
 To improve simulation efficiency, `matrix-bgpsim` compresses the Internet topology by separating _core ASes_ from _branch ASes_.
 
-* Core ASes are the main nodes in the network that participate directly in the matrix-based BGP route inference. These typically include ASes with multiple providers, multiple customers, or any peers.
+* Core ASes are the main nodes in the network that participate directly in the matrix-based BGP routing simulation. These typically include ASes with multiple providers, multiple customers, or any peers.
 
 * Branch ASes are typically single-homed ASes or stub networks whose routing tables can be fully derived from their upstream access AS. A branch is defined recursively as a sequence of ASes starting from a stub AS and following its single provider until reaching a core AS (the access AS) with either:
     -   more than one provider,
@@ -236,7 +236,7 @@ The key intuition is that all routes to or from branch ASes pass through their a
 
 1. The core topology is extracted by pruning all branch ASes.
 2. BGP routing simulation is performed only on the core topology.
-3. outes for branch ASes are efficiently reconstructed afterwards using their access AS’s routing table, e.g., by concatenating the branch sequence.
+3. Routes for branch ASes are efficiently reconstructed afterwards using their access AS’s routing table, e.g., by concatenating the branch sequence.
 
 This approach significantly reduces simulation complexity while preserving complete routing information. In practice, it can reduce topology size by over 30% in vertices, leaving only the core ASes for matrix-based computation.
 
@@ -250,7 +250,7 @@ Route selection in BGP can be computationally expensive. `matrix-bgpsim` speeds 
         - `10`: peer route
         - `01`: provider route
         - `00`: unreachable origin
-    - The six least significant bits store the bitwise complement of the path length (max 63 hops).
+    - The six least significant bits store the _bitwise complement_ of the path length (max 63 hops).
 
 * Why design so:
     - Higher byte values indicate more preferred routes.
@@ -261,19 +261,19 @@ This encoding allows `matrix-bgpsim` to turn complex BGP iterations into highly 
 
 ### Matrix Operations
 
-`matrix-bgpsim` represents the network as matrices, allowing route propagation and next-hop computation to be performed in a fully vectorized way.
+`matrix-bgpsim` represents the network as matrices, allowing route propagation and next-hop computation to be performed in a highly vectorized way.
 
-* State matrix: Each element encodes the route priority (local preference + path length) from a source AS to a destination AS using the one-byte encoding.
+* State matrix: Each element encodes the route priority (local preference and path length) from a source AS to a destination AS using the one-byte encoding.
 
 * Next-hop matrix: Stores the index of the first AS to forward a route toward a destination. It is updated simultaneously with the state matrix.
 
 * Initialization:
     - The diagonal of the state matrix is set to enforce self-reachability.
     - Neighbor relationships (C2P, P2P, P2C) are initialized with appropriate priorities in the state matrix.
-    - Link matrices (link1 and link2) help track propagation directions.
+    - Link matrices (link1 and link2) help track propagation information.
 
 * Propagation loop:
-    1. Prepare state updates: Bitwise operations separate the local preference and path length fields and combine them for propagation.
+    1. Prepare state updates: Bitwise operations separate the local preference and path length fields and update them for propagation.
     2. Compute new priorities: For each destination, the algorithm evaluates all incoming routes via neighbors and selects the maximum priority route.
     3. Update next-hop matrix: The index corresponding to the chosen route becomes the next hop for that destination.
     4. Repeat: Iteration continues until the routing state converges. 
@@ -288,7 +288,7 @@ This encoding allows `matrix-bgpsim` to turn complex BGP iterations into highly 
 
 * Advantages:
 
-    - Fully vectorized using PyTorch (or CuPy/NumPy for other backends).
+    - Highly vectorized using NumPy, PyTorch or CuPy backends.
     - Efficient next-hop tracking allows fast path reconstruction on demand.
     - Matrix operations reduce BGP propagation to bitwise and arithmetic operations, maximizing speed and memory efficiency.
 
